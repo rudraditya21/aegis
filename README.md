@@ -1,1 +1,67 @@
-# aegis
+# Aegis
+
+High-performance Rust firewall/IDS workspace.
+
+## Workspace Map
+
+| Crate | Purpose |
+| --- | --- |
+| `packet-parser` | Bounds-checked Ethernet/VLAN, IPv4/IPv6, TCP/UDP/ICMP parsing + TCP reassembly helpers |
+| `aegis-core` | Stateless/stateful engine (L3/L4 rules, flow tracker, TCP FSM, LRU, attack protection, DPI hooks, threat intel, HA hooks) |
+| `aegis-utils` | Shared helpers (config root resolution, hex parsing) |
+| `aegis` | CLI and runtime wrapper (rules/policies, capture, eval, metrics, failover controls) |
+
+## Quick Start
+
+- Run tests: `cargo test`
+- Add rule: `cargo run -p aegis -- add-rule --rules rules.txt --rule "allow cidr 10.0.0.0/8 ingress"`
+- List rules: `cargo run -p aegis -- list-rules --rules rules.txt`
+- Evaluate hex packet: `cargo run -p aegis -- eval --rules rules.txt --direction ingress --hex "<hex bytes>"`
+- Capture (pcap): `cargo run -p aegis -- capture --rules rules.txt --iface eth0 --count 10`
+- Docker: `docker build -t aegis . && docker run --rm aegis`
+
+### Rule File Format
+
+One rule per line (`#` for comments):
+- `allow cidr 10.0.0.0/8 ingress`
+- `deny port tcp 22 ingress`
+- `allow port udp 1000-2000 ingress`
+- `deny proto icmpv6 egress`
+- `default deny ingress`
+
+Evaluation order: LPM CIDR → port range/exact → protocol → default (directional) → implicit deny.
+
+## Implemented Features
+
+| Area | Highlights |
+| --- | --- |
+| Packet parsing | Bounds-checked Ethernet/VLAN, IPv4/IPv6, TCP/UDP/ICMP; fragment rejection; VLAN stacking; TCP overlap-aware reassembly |
+| Stateless L3/L4 | CIDR allow/deny (LPM), port/proto rules, per-direction defaults, conflict resolution (deny > allow; redirect wins) |
+| Stateful flows | 5-tuple flow table; TCP state machine; handshake/established/closed timeouts; LRU eviction; per-CPU stats; flow snapshot/sync hooks |
+| DPI / App ID | HTTP/DNS/TLS/file heuristics; TLS ClientHello metadata (SNI, ciphers) including reassembled payloads; signature engine (SQLi/XSS/path traversal); normalization (double percent-decode, BOM strip); tail-aware scanning |
+| Policy engine | Priority if/then policies; geo/time/user/app match; conflict resolution; hit counters; versioned apply |
+| Threat intel | IP/domain blocklists with timestamps; geo/user enrichment hooks; dynamic block support |
+| Attack protection | SYN/ICMP/UDP rate limiting; invalid ACK drop; behavior detector (rate + beaconing); signature blocking (optional); C2 beacon alerts; protector counters decay |
+| TLS/IPS controls | TLS policy on SNI/cipher; IDS/IPS toggles; DPI logging toggle; geo/time toggles; failover flags; flow capacity controls |
+| HA/failover | Flow state export/import; failover enable/disable; flow capacity setter |
+| CLI | Rule/policy add/remove/list; eval/eval-batch; replay files; capture/capture-async; metrics; audit-status; show-config-root; failover controls; behavior/signature blocking toggles; Rayon batch eval |
+| PCAP shim | Safe wrapper for open/live/next/drop; build.rs generates libpcap bindings; unsafe confined to FFI boundary |
+
+## Test & Validation Matrix
+
+| Suite | What it covers | How to run |
+| --- | --- | --- |
+| Unit tests | Parsing, TCP FSM, LRU, policies, threat intel, TLS parsing, signatures, behavior detector | `cargo test` |
+| Attack simulations | SYN/ACK/UDP/ICMP floods, DNS amplification, HTTP flood/Slowloris, obfuscation/double-encoding, TLS handshake flood, fragmented TLS ClientHello, TCP segmentation evasion, fragmentation, protocol confusion, exploit signatures, C2 beaconing | `bash scripts/run_regressions.sh` (runs all) or individual `scripts/attack_*.sh` |
+| Policy correctness | LPM precedence, port deny precedence, default deny | `bash scripts/run_policy_correctness.sh` |
+| Performance & stress | Throughput/latency/flow-scale/rule-scale, eval-batch (Rayon), optional iperf3/tcpreplay/hping3/wrk/dnsperf hooks | `bash scripts/run_perf_stress.sh` |
+| Stability/soak | Mixed traffic/attacks over time (configurable; smoke with SOAK_DURATION=300) | `SOAK_DURATION=300 bash scripts/run_long_soak.sh` |
+| Chaos | Fail-open/closed kill test, reload storm, memory/fd pressure | `bash scripts/chaos_userspace_crash.sh`, `bash scripts/chaos_config_reload_storm.sh`, `bash scripts/chaos_resource_exhaustion.sh` |
+| Feature matrix | End-to-end sample flows across rule/policy features | `bash scripts/run_feature_matrix.sh` |
+
+## Shortcuts
+
+- Full regressions: `bash scripts/run_regressions.sh`
+- Perf (synthetic): `bash scripts/run_perf_stress.sh`
+- Stability smoke (5m): `SOAK_DURATION=300 bash scripts/run_long_soak.sh`
+- Everything (tests + attacks + feature matrix): `bash scripts/run_all_tests.sh`
