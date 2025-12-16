@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/core",
     "crates/packet-parser", "crates/pcap-shim", "crates/utils",
+    "crates/config",
     "aegis",
 ]
 resolver = "2"

@@ -1,23 +1,29 @@
 # Aegis
 
-High-performance Rust firewall/IDS workspace.
+High-performance Rust firewall/IDS workspace with persistent configuration under `/etc/aegis`.
 
 ## Workspace Map
 
 | Crate | Purpose |
 | --- | --- |
 | `packet-parser` | Bounds-checked Ethernet/VLAN, IPv4/IPv6, TCP/UDP/ICMP parsing + TCP reassembly helpers |
+| `config` | Persistent config root manager (versioning, integrity, rollback) |
 | `aegis-core` | Stateless/stateful engine (L3/L4 rules, flow tracker, TCP FSM, LRU, attack protection, DPI hooks, threat intel, HA hooks) |
 | `aegis-utils` | Shared helpers (config root resolution, hex parsing) |
 | `aegis` | CLI and runtime wrapper (rules/policies, capture, eval, metrics, failover controls) |
 
 ## Quick Start
 
+- Config root: defaults to `/etc/aegis` (override with `AEGIS_CONFIG_ROOT`). Layout:
+  - `aegis.yaml` (optional), `rules/l3l4.rules`, `rules/dpi.rules`, `rules/policies.rules`
+  - `intel/ip_blocklist.txt`, `intel/domain_blocklist.txt`
+  - `state/flows.snapshot`, `state/counters.bin`, `state/versions/` (backups)
+  - `logs/alerts.log`, `logs/dpi.log`, `logs/audit.log`
 - Run tests: `cargo test`
-- Add rule: `cargo run -p aegis -- add-rule --rules rules.txt --rule "allow cidr 10.0.0.0/8 ingress"`
-- List rules: `cargo run -p aegis -- list-rules --rules rules.txt`
-- Evaluate hex packet: `cargo run -p aegis -- eval --rules rules.txt --direction ingress --hex "<hex bytes>"`
-- Capture (pcap): `cargo run -p aegis -- capture --rules rules.txt --iface eth0 --count 10`
+- Add rule: `cargo run -p aegis -- add-rule --rules /etc/aegis/rules/l3l4.rules --rule "allow cidr 10.0.0.0/8 ingress"`
+- List rules: `cargo run -p aegis -- list-rules --rules /etc/aegis/rules/l3l4.rules`
+- Evaluate hex packet: `cargo run -p aegis -- eval --rules /etc/aegis/rules/l3l4.rules --direction ingress --hex "<hex bytes>"`
+- Capture (pcap): `cargo run -p aegis -- capture --rules /etc/aegis/rules/l3l4.rules --iface eth0 --count 10`
 - Docker: `docker build -t aegis . && docker run --rm aegis`
 
 ### Rule File Format

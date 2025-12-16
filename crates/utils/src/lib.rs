@@ -7,11 +7,16 @@ pub fn config_root() -> PathBuf {
         .ok()
         .or_else(|| std::env::var("FIREWALL_CONFIG_ROOT").ok())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/config"))
+        .unwrap_or_else(|| PathBuf::from("/etc/aegis"))
 }
 
 pub fn resolve_config_path(path: &str, allow_write: bool) -> Result<PathBuf, String> {
     let root = config_root();
+    let root_canon = if root.exists() {
+        root.canonicalize().unwrap_or_else(|_| root.clone())
+    } else {
+        root.clone()
+    };
     let p = Path::new(path);
     let abs = if p.exists() {
         p.canonicalize()
@@ -23,15 +28,15 @@ pub fn resolve_config_path(path: &str, allow_write: bool) -> Result<PathBuf, Str
                 .canonicalize()
                 .map_err(|e| format!("canonicalize parent of {path}: {e}"))?
         } else {
-            root.clone()
+            root_canon.clone()
         };
         base.join(p.file_name().ok_or_else(|| "invalid path".to_string())?)
     };
-    if abs.components().count() == 0 || !abs.starts_with(&root) {
+    if abs.components().count() == 0 || !abs.starts_with(&root_canon) {
         return Err(format!(
             "path {} must reside under config root {}",
             abs.display(),
-            root.display()
+            root_canon.display()
         ));
     }
     if allow_write {
