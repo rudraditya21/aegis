@@ -28,6 +28,7 @@ struct Tuning {
     signature_tail_budget: usize,
     backpressure_mode: BackpressureMode,
     fail_mode: Option<FailMode>,
+    dpi_scratch_budget: usize,
 }
 
 impl Default for Tuning {
@@ -38,6 +39,7 @@ impl Default for Tuning {
             signature_tail_budget: 64 * 1024,
             backpressure_mode: BackpressureMode::Drop,
             fail_mode: None,
+            dpi_scratch_budget: 256 * 1024,
         }
     }
 }
@@ -259,6 +261,12 @@ fn cmd_eval(args: Vec<String>) -> Result<(), String> {
                         v.parse().map_err(|_| "invalid signature tail budget")?;
                 }
             }
+            "--dpi-scratch-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.dpi_scratch_budget =
+                        v.parse().map_err(|_| "invalid dpi scratch budget")?;
+                }
+            }
             "--backpressure" => {
                 if let Some(v) = iter.next() {
                     tuning.backpressure_mode = parse_backpressure(v)?;
@@ -410,6 +418,12 @@ fn cmd_eval_batch(args: Vec<String>) -> Result<(), String> {
                         v.parse().map_err(|_| "invalid signature tail budget")?;
                 }
             }
+            "--dpi-scratch-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.dpi_scratch_budget =
+                        v.parse().map_err(|_| "invalid dpi scratch budget")?;
+                }
+            }
             "--backpressure" => {
                 if let Some(v) = iter.next() {
                     tuning.backpressure_mode = parse_backpressure(v)?;
@@ -537,6 +551,12 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
                 if let Some(v) = iter.next() {
                     tuning.signature_tail_budget =
                         v.parse().map_err(|_| "invalid signature tail budget")?;
+                }
+            }
+            "--dpi-scratch-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.dpi_scratch_budget =
+                        v.parse().map_err(|_| "invalid dpi scratch budget")?;
                 }
             }
             "--backpressure" => {
@@ -1047,6 +1067,7 @@ fn load_manager(
     }
     mgr.set_reassembly_buffer(tuning.reassembly_buffer);
     mgr.set_signature_tail_budget(tuning.signature_tail_budget);
+    mgr.set_dpi_scratch_budget(tuning.dpi_scratch_budget);
     mgr.set_backpressure_mode(tuning.backpressure_mode);
     let fail_mode = tuning.fail_mode.unwrap_or_else(resolve_fail_mode);
     mgr.set_fail_mode(fail_mode);
@@ -1085,6 +1106,7 @@ fn load_manager_from_lines(
     }
     mgr.set_reassembly_buffer(tuning.reassembly_buffer);
     mgr.set_signature_tail_budget(tuning.signature_tail_budget);
+    mgr.set_dpi_scratch_budget(tuning.dpi_scratch_budget);
     mgr.set_backpressure_mode(tuning.backpressure_mode);
     let fail_mode = tuning.fail_mode.unwrap_or_else(resolve_fail_mode);
     mgr.set_fail_mode(fail_mode);

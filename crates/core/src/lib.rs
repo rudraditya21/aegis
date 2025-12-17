@@ -1045,6 +1045,8 @@ pub struct FirewallManager {
     signature_tail_lru: VecDeque<FlowKey>,
     signature_tail_budget: usize,
     signature_tail_bytes: usize,
+    dpi_scratch_budget: usize,
+    dpi_scratch_in_use: usize,
     block_behavior: bool,
     block_signatures: bool,
     block_c2: bool,
@@ -1091,6 +1093,8 @@ impl FirewallManager {
             signature_tail_lru: VecDeque::new(),
             signature_tail_budget: 64 * 1024,
             signature_tail_bytes: 0,
+            dpi_scratch_budget: 256 * 1024,
+            dpi_scratch_in_use: 0,
             block_behavior: false,
             block_signatures: true,
             block_c2: false,
@@ -1152,6 +1156,10 @@ impl FirewallManager {
     pub fn set_signature_tail_budget(&mut self, bytes: usize) {
         self.signature_tail_budget = bytes.max(32);
         self.enforce_signature_tail_budget();
+    }
+
+    pub fn set_dpi_scratch_budget(&mut self, bytes: usize) {
+        self.dpi_scratch_budget = bytes.max(4096);
     }
 
     pub fn flow_capacity(&self) -> usize {
@@ -1234,6 +1242,9 @@ impl FirewallManager {
             self.matching_rule_id(&meta, &base_action)
         };
         let flow = self.flows.observe(&meta, now);
+        if let Some(evicted) = self.flows.take_last_evicted() {
+            self.note_flow_eviction(evicted, now);
+        }
         let mut blocked_by_protector = false;
         if self.ips_enabled && !self.protector.check(&meta, &flow, now) {
             action = Action::Deny;
@@ -1332,21 +1343,32 @@ impl FirewallManager {
                 buf.extend_from_slice(tail);
             }
             buf.extend_from_slice(data);
-            // Scan raw and normalized encodings.
-            sig_hits = self.signature_engine.scan_exploits(&buf);
-            let norm = normalize_payload(&buf);
-            let mut norm_hits = self.signature_engine.scan_exploits(&norm);
-            sig_hits.append(&mut norm_hits);
-            // Update TLS metadata from reassembled payload if present.
-            if meta.tls.is_none() {
-                if let Some(tls) = parse_tls_metadata(&buf) {
-                    meta.tls = Some(tls);
+            let scratch_needed = buf.len().saturating_mul(2);
+            let mut scratch_claimed = false;
+            if self.dpi_scratch_in_use + scratch_needed <= self.dpi_scratch_budget {
+                self.dpi_scratch_in_use += scratch_needed;
+                scratch_claimed = true;
+                // Scan raw and normalized encodings.
+                sig_hits = self.signature_engine.scan_exploits(&buf);
+                let norm = normalize_payload(&buf);
+                let mut norm_hits = self.signature_engine.scan_exploits(&norm);
+                sig_hits.append(&mut norm_hits);
+                // Update TLS metadata from reassembled payload if present.
+                if meta.tls.is_none() {
+                    if let Some(tls) = parse_tls_metadata(&buf) {
+                        meta.tls = Some(tls);
+                    }
                 }
+                // Update tail with last 32 bytes for future detections; enforce budget.
+                let keep = buf.len().min(32);
+                let tail = buf[buf.len() - keep..].to_vec();
+                self.insert_signature_tail(flow_key, tail);
+            } else {
+                backpressure = true;
             }
-            // Update tail with last 32 bytes for future detections; enforce budget.
-            let keep = buf.len().min(32);
-            let tail = buf[buf.len() - keep..].to_vec();
-            self.insert_signature_tail(flow_key, tail);
+            if scratch_claimed {
+                self.dpi_scratch_in_use = self.dpi_scratch_in_use.saturating_sub(scratch_needed);
+            }
         } else {
             self.signature_tails.remove(&flow_key);
             self.signature_tail_lru.retain(|k| k != &flow_key);
@@ -1356,12 +1378,31 @@ impl FirewallManager {
                 BackpressureMode::Drop => {
                     action = Action::Deny;
                     blocked_by_protector = true;
+                    if self.ids_enabled {
+                        self.push_resource_alert(
+                            BehaviorKind::Backpressure,
+                            meta.src_ip,
+                            Some(meta.dst_ip),
+                            meta.dst_port,
+                            1,
+                            now,
+                        );
+                    }
                 }
                 BackpressureMode::Bypass => {
                     sig_hits.clear();
                 }
                 BackpressureMode::LogOnly => {
-                    // keep action; we could add an alert, but keep lightweight
+                    if self.ids_enabled {
+                        self.push_resource_alert(
+                            BehaviorKind::Backpressure,
+                            meta.src_ip,
+                            Some(meta.dst_ip),
+                            meta.dst_port,
+                            1,
+                            now,
+                        );
+                    }
                 }
             }
         }
@@ -1491,6 +1532,19 @@ impl FirewallManager {
         self.rule_hits.clone()
     }
 
+    pub fn resource_alerts(&self) -> Vec<BehaviorAlert> {
+        self.alerts
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.kind,
+                    BehaviorKind::Backpressure | BehaviorKind::ResourceExhausted
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn add_identity(&mut self, ip: IpAddr, user: String) {
         self.identity_map.insert(ip, user);
     }
@@ -1571,6 +1625,46 @@ impl FirewallManager {
             self.alerts.pop_front();
         }
         self.alerts.push_back(alert);
+    }
+
+    fn push_resource_alert(
+        &mut self,
+        kind: BehaviorKind,
+        src: IpAddr,
+        dst: Option<IpAddr>,
+        port: Option<u16>,
+        count: u64,
+        now: Instant,
+    ) {
+        let alert = BehaviorAlert {
+            kind,
+            src,
+            dst,
+            port,
+            count,
+            timestamp: now,
+        };
+        self.push_alert(alert);
+        self.suspicious.insert(FlowKey {
+            src_ip: src,
+            dst_ip: dst.unwrap_or(src),
+            src_port: port.unwrap_or(0),
+            dst_port: port.unwrap_or(0),
+            protocol: IpProtocol::Tcp,
+        });
+    }
+
+    fn note_flow_eviction(&mut self, key: FlowKey, now: Instant) {
+        if self.ids_enabled {
+            self.push_resource_alert(
+                BehaviorKind::ResourceExhausted,
+                key.src_ip,
+                Some(key.dst_ip),
+                Some(key.dst_port),
+                1,
+                now,
+            );
+        }
     }
 
     fn insert_signature_tail(&mut self, key: FlowKey, tail: Vec<u8>) {

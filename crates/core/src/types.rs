@@ -44,6 +44,7 @@ pub enum BehaviorKind {
     Beacon,
     Signature,
     Backpressure,
+    ResourceExhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
