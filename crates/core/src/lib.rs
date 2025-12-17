@@ -188,6 +188,53 @@ impl PolicyCondition {
         }
         true
     }
+
+    pub fn overlaps(&self, other: &PolicyCondition) -> bool {
+        let cidr_overlap = |a: &Option<Cidr>, b: &Option<Cidr>| -> bool {
+            match (a, b) {
+                (Some(ca), Some(cb)) => ca.contains_any(cb) || cb.contains_any(ca),
+                _ => true,
+            }
+        };
+        if !cidr_overlap(&self.src, &other.src) {
+            return false;
+        }
+        if !cidr_overlap(&self.dst, &other.dst) {
+            return false;
+        }
+
+        let list_overlap = |a: &Vec<String>, b: &Vec<String>| -> bool {
+            if a.is_empty() || b.is_empty() {
+                return true;
+            }
+            a.iter().any(|x| b.iter().any(|y| y == x))
+        };
+        if !list_overlap(&self.users, &other.users) {
+            return false;
+        }
+        let apps_overlap = |a: &Vec<ApplicationType>, b: &Vec<ApplicationType>| -> bool {
+            if a.is_empty() || b.is_empty() {
+                return true;
+            }
+            a.iter().any(|x| b.iter().any(|y| y == x))
+        };
+        if !apps_overlap(&self.applications, &other.applications) {
+            return false;
+        }
+        if !list_overlap(&self.geos, &other.geos) {
+            return false;
+        }
+        let time_overlap = |a: &Vec<TimeWindow>, b: &Vec<TimeWindow>| -> bool {
+            if a.is_empty() || b.is_empty() {
+                return true;
+            }
+            a.iter().any(|wa| b.iter().any(|wb| wa.overlaps(wb)))
+        };
+        if !time_overlap(&self.time_windows, &other.time_windows) {
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +251,16 @@ impl TimeWindow {
             // wrap-around (e.g., 22-2)
             hour >= self.start_hour || hour <= self.end_hour
         }
+    }
+
+    pub fn overlaps(&self, other: &TimeWindow) -> bool {
+        // Simple overlap check using discrete hours.
+        for h in 0..24u8 {
+            if self.contains(h) && other.contains(h) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -300,8 +357,11 @@ impl PolicyEngine {
 pub fn validate_policies(entries: &[PolicyEntry]) -> Result<(), String> {
     for (i, a) in entries.iter().enumerate() {
         for b in entries.iter().skip(i + 1) {
-            if a.priority == b.priority && a.action != b.action && a.condition == b.condition {
-                return Err("conflicting policy actions with same priority/condition".into());
+            if a.condition == b.condition && a.action != b.action {
+                return Err("conflicting policy actions for identical conditions".into());
+            }
+            if a.action != b.action && a.condition.overlaps(&b.condition) {
+                return Err("conflicting policy actions with overlapping conditions".into());
             }
         }
     }
@@ -2103,6 +2163,97 @@ mod tests {
             },
         ];
         assert!(validate_rules(&rules).is_err());
+    }
+
+    #[test]
+    fn validate_policies_catches_identical_condition_conflict() {
+        let cond = PolicyCondition {
+            src: Some(parse_cidr("10.0.0.0/8").unwrap()),
+            dst: None,
+            users: Vec::new(),
+            applications: Vec::new(),
+            geos: Vec::new(),
+            time_windows: Vec::new(),
+        };
+        let entries = vec![
+            PolicyEntry {
+                priority: 10,
+                action: Action::Allow,
+                condition: cond.clone(),
+            },
+            PolicyEntry {
+                priority: 5,
+                action: Action::Deny,
+                condition: cond,
+            },
+        ];
+        assert!(validate_policies(&entries).is_err());
+    }
+
+    #[test]
+    fn validate_policies_catches_overlap_same_priority_conflict() {
+        let cond_a = PolicyCondition {
+            src: Some(parse_cidr("10.0.0.0/8").unwrap()),
+            dst: None,
+            users: Vec::new(),
+            applications: vec![ApplicationType::Http],
+            geos: Vec::new(),
+            time_windows: Vec::new(),
+        };
+        let cond_b = PolicyCondition {
+            src: Some(parse_cidr("10.0.0.0/16").unwrap()),
+            dst: None,
+            users: Vec::new(),
+            applications: vec![ApplicationType::Http],
+            geos: Vec::new(),
+            time_windows: Vec::new(),
+        };
+        let entries = vec![
+            PolicyEntry {
+                priority: 5,
+                action: Action::Allow,
+                condition: cond_a,
+            },
+            PolicyEntry {
+                priority: 5,
+                action: Action::Deny,
+                condition: cond_b,
+            },
+        ];
+        assert!(validate_policies(&entries).is_err());
+    }
+
+    #[test]
+    fn validate_policies_catches_overlap_different_priority_conflict() {
+        let cond_a = PolicyCondition {
+            src: Some(parse_cidr("10.0.0.0/8").unwrap()),
+            dst: None,
+            users: Vec::new(),
+            applications: vec![ApplicationType::Http],
+            geos: Vec::new(),
+            time_windows: Vec::new(),
+        };
+        let cond_b = PolicyCondition {
+            src: Some(parse_cidr("10.0.0.0/16").unwrap()),
+            dst: None,
+            users: Vec::new(),
+            applications: vec![ApplicationType::Http],
+            geos: Vec::new(),
+            time_windows: Vec::new(),
+        };
+        let entries = vec![
+            PolicyEntry {
+                priority: 10,
+                action: Action::Allow,
+                condition: cond_a,
+            },
+            PolicyEntry {
+                priority: 1,
+                action: Action::Deny,
+                condition: cond_b,
+            },
+        ];
+        assert!(validate_policies(&entries).is_err());
     }
 
     #[test]
