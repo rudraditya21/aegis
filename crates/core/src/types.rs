@@ -70,3 +70,9 @@ pub struct TlsPolicy {
     pub enforce: bool,
     pub allow_decryption: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailMode {
+    FailOpen,
+    FailClosed,
+}

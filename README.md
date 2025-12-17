@@ -24,6 +24,7 @@ High-performance Rust firewall/IDS workspace with persistent configuration under
 - List rules: `cargo run -p aegis -- list-rules --rules /etc/aegis/rules/l3l4.rules`
 - Evaluate hex packet: `cargo run -p aegis -- eval --rules /etc/aegis/rules/l3l4.rules --direction ingress --hex "<hex bytes>"`
 - Capture (pcap): `cargo run -p aegis -- capture --rules /etc/aegis/rules/l3l4.rules --iface eth0 --count 10`
+- Fail mode: default fail-closed when no rules loaded; set `AEGIS_FAIL_OPEN=1` to start in fail-open.
 - Docker: `docker build -t aegis . && docker run --rm aegis`
 
 ### Rule File Format

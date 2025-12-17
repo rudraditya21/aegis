@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use aegis_core::{
-    Action, ApplicationType, BehaviorKind, Cidr, Direction, FirewallManager, PacketMetadata,
-    PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject, SignatureEngine, TimeWindow,
-    TlsMetadata, parse_cidr,
+    Action, ApplicationType, BehaviorKind, Cidr, Direction, FailMode, FirewallManager,
+    PacketMetadata, PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject, SignatureEngine,
+    TimeWindow, TlsMetadata, parse_cidr, validate_policies, validate_rules,
 };
 use packet_parser::{
     EtherType, IpProtocol, ParseError, parse_ethernet_frame, parse_ipv4_packet, parse_ipv6_packet,
@@ -877,9 +877,14 @@ fn load_manager(
     policies_path: Option<&std::path::Path>,
 ) -> Result<FirewallManager, String> {
     let lines = read_rule_lines(rules_path)?;
-    let mut mgr = FirewallManager::new(65535);
+    let mut parsed_rules = Vec::new();
     for line in lines {
         let rule = parse_rule_line(&line)?;
+        parsed_rules.push(rule);
+    }
+    validate_rules(&parsed_rules)?;
+    let mut mgr = FirewallManager::new(65535);
+    for rule in parsed_rules {
         mgr.add_rule(rule);
     }
     if let Some(path) = policies_path {
@@ -894,8 +899,10 @@ fn load_manager(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        validate_policies(&entries)?;
         mgr.apply_policy_entries(entries);
     }
+    mgr.set_fail_mode(resolve_fail_mode());
     Ok(mgr)
 }
 
@@ -903,9 +910,14 @@ fn load_manager_from_lines(
     rules: &[String],
     policies: &[String],
 ) -> Result<FirewallManager, String> {
-    let mut mgr = FirewallManager::new(65535);
+    let mut parsed_rules = Vec::new();
     for line in rules {
         let rule = parse_rule_line(line)?;
+        parsed_rules.push(rule);
+    }
+    validate_rules(&parsed_rules)?;
+    let mut mgr = FirewallManager::new(65535);
+    for rule in parsed_rules {
         mgr.add_rule(rule);
     }
     if !policies.is_empty() {
@@ -920,8 +932,10 @@ fn load_manager_from_lines(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        validate_policies(&entries)?;
         mgr.apply_policy_entries(entries);
     }
+    mgr.set_fail_mode(resolve_fail_mode());
     Ok(mgr)
 }
 
@@ -1253,6 +1267,17 @@ fn parse_action(token: Option<&str>) -> Option<Result<Action, String>> {
         }
         Some(other) => Some(Err(format!("unknown action {other}"))),
         None => None,
+    }
+}
+
+fn resolve_fail_mode() -> FailMode {
+    let env_open = std::env::var("AEGIS_FAIL_OPEN").ok();
+    let env_closed = std::env::var("AEGIS_FAIL_CLOSED").ok();
+    match (env_open.as_deref(), env_closed.as_deref()) {
+        (Some("1"), Some("1")) => FailMode::FailClosed,
+        (Some("1"), _) => FailMode::FailOpen,
+        (_, Some("1")) => FailMode::FailClosed,
+        _ => FailMode::FailClosed,
     }
 }
 

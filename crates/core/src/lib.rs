@@ -293,6 +293,17 @@ impl PolicyEngine {
     }
 }
 
+pub fn validate_policies(entries: &[PolicyEntry]) -> Result<(), String> {
+    for (i, a) in entries.iter().enumerate() {
+        for b in entries.iter().skip(i + 1) {
+            if a.priority == b.priority && a.action != b.action && a.condition == b.condition {
+                return Err("conflicting policy actions with same priority/condition".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn classify_path(action: &Action, flow: &FlowOutcome, blocked: bool) -> Path {
     if blocked {
         return Path::Slow(SlowReason::AttackProtection);
@@ -369,6 +380,10 @@ impl PortRange {
     pub fn contains(&self, port: u16) -> bool {
         port >= self.start && port <= self.end
     }
+
+    pub fn overlaps(&self, other: &PortRange) -> bool {
+        !(self.end < other.start || other.end < self.start)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +417,72 @@ impl Cidr {
             Cidr::V6 { prefix, .. } => *prefix,
         }
     }
+
+    pub fn contains_any(&self, other: &Cidr) -> bool {
+        match (self, other) {
+            (Cidr::V4 { addr: a, prefix: pa }, Cidr::V4 { addr: b, prefix: pb }) => {
+                let mask = mask_v4(*pa.min(pb));
+                (u32::from_be_bytes(a.octets()) & mask) == (u32::from_be_bytes(b.octets()) & mask)
+            }
+            (Cidr::V6 { addr: a, prefix: pa }, Cidr::V6 { addr: b, prefix: pb }) => {
+                let mask = mask_v6(*pa.min(pb));
+                (u128::from_be_bytes(a.octets()) & mask)
+                    == (u128::from_be_bytes(b.octets()) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn validate_rules(rules: &[Rule]) -> Result<(), String> {
+    let mut default_ingress = 0;
+    let mut default_egress = 0;
+    for r in rules {
+        if let RuleSubject::Default = r.subject {
+            match r.direction {
+                Direction::Ingress => default_ingress += 1,
+                Direction::Egress => default_egress += 1,
+            }
+        }
+    }
+    if default_ingress > 1 || default_egress > 1 {
+        return Err("multiple default rules per direction detected".into());
+    }
+
+    for (i, a) in rules.iter().enumerate() {
+        for b in rules.iter().skip(i + 1) {
+            if a.direction != b.direction {
+                continue;
+            }
+            match (&a.subject, &b.subject) {
+                (RuleSubject::Cidr { network: ca }, RuleSubject::Cidr { network: cb }) => {
+                    if (ca.contains_any(cb) || cb.contains_any(ca)) && a.action != b.action {
+                        return Err(format!(
+                            "conflicting CIDR rules overlap ({:?} vs {:?})",
+                            ca, cb
+                        ));
+                    }
+                }
+                (
+                    RuleSubject::Port {
+                        protocol: pa,
+                        range: ra,
+                    },
+                    RuleSubject::Port {
+                        protocol: pb,
+                        range: rb,
+                    },
+                ) if pa == pb && ra.overlaps(rb) && a.action != b.action => {
+                    return Err(format!(
+                        "conflicting port rules overlap ({:?} vs {:?})",
+                        ra, rb
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,6 +1003,7 @@ pub struct FirewallManager {
     suspicious: HashSet<FlowKey>,
     rule_hits: HashMap<u64, u64>,
     time_override: Option<u8>,
+    fail_mode: FailMode,
 }
 
 impl FirewallManager {
@@ -963,6 +1045,7 @@ impl FirewallManager {
             suspicious: HashSet::new(),
             rule_hits: HashMap::new(),
             time_override: None,
+            fail_mode: FailMode::FailClosed,
         }
     }
 
@@ -1053,13 +1136,22 @@ impl FirewallManager {
         let mut meta = self.enrich_metadata(meta);
         let flow_key = FlowKey::from_metadata(&meta);
         let iface_allowed = self.interface_allowed(interface);
-        let base_action = if iface_allowed {
+        let base_action = if self.firewall.rules.is_empty() {
+            match self.fail_mode {
+                FailMode::FailOpen => Action::Allow,
+                FailMode::FailClosed => Action::Deny,
+            }
+        } else if iface_allowed {
             self.firewall.evaluate(&meta)
         } else {
             Action::Deny
         };
         let mut action = base_action.clone();
-        let mut matched_rule = self.matching_rule_id(&meta, &base_action);
+        let mut matched_rule = if self.firewall.rules.is_empty() {
+            None
+        } else {
+            self.matching_rule_id(&meta, &base_action)
+        };
         let flow = self.flows.observe(&meta, now);
         let mut blocked_by_protector = false;
         if self.ips_enabled && !self.protector.check(&meta, &flow, now) {
@@ -1349,6 +1441,10 @@ impl FirewallManager {
 
     pub fn set_time_override(&mut self, hour: Option<u8>) {
         self.time_override = hour;
+    }
+
+    pub fn set_fail_mode(&mut self, mode: FailMode) {
+        self.fail_mode = mode;
     }
 
     fn enrich_metadata(&self, meta: &PacketMetadata) -> PacketMetadata {
@@ -1918,6 +2014,39 @@ mod tests {
         let _ = prot_mgr.evaluate(&pkt_protected, None, Instant::now());
         let eval3 = prot_mgr.evaluate(&pkt_protected, None, Instant::now());
         assert!(matches!(eval3.path, Path::Slow(_)));
+    }
+
+    #[test]
+    fn validate_rules_catches_conflicts() {
+        let rules = vec![
+            Rule {
+                action: Action::Allow,
+                subject: RuleSubject::Cidr {
+                    network: parse_cidr("10.0.0.0/8").unwrap(),
+                },
+                direction: Direction::Ingress,
+            },
+            Rule {
+                action: Action::Deny,
+                subject: RuleSubject::Cidr {
+                    network: parse_cidr("10.0.0.0/16").unwrap(),
+                },
+                direction: Direction::Ingress,
+            },
+        ];
+        assert!(validate_rules(&rules).is_err());
+    }
+
+    #[test]
+    fn fail_mode_applies_when_no_rules() {
+        let mut mgr = FirewallManager::new(4);
+        let meta = meta("1.1.1.1", IpProtocol::Tcp, Some(1000), Some(80), None);
+        let eval_closed = mgr.evaluate(&meta, None, Instant::now());
+        assert_eq!(eval_closed.action, Action::Deny);
+
+        mgr.set_fail_mode(FailMode::FailOpen);
+        let eval_open = mgr.evaluate(&meta, None, Instant::now());
+        assert_eq!(eval_open.action, Action::Allow);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use aegis_config::{ConfigManager, ConfigPaths};
+use aegis_config::ConfigManager;
 use std::fs;
 use std::io::Write;
 use tempfile::tempdir;
