@@ -97,6 +97,7 @@ pub struct FlowTable {
     handshake_timeout: Duration,
     established_timeout: Duration,
     closed_timeout: Duration,
+    last_evicted: Option<FlowKey>,
 }
 
 impl FlowTable {
@@ -119,6 +120,7 @@ impl FlowTable {
             handshake_timeout: Duration::from_secs(30),
             established_timeout: Duration::from_secs(300),
             closed_timeout: Duration::from_secs(15),
+            last_evicted: None,
         }
     }
 
@@ -270,6 +272,7 @@ impl FlowTable {
         {
             self.table.remove(&oldest);
             self.bump_evicted(cpu);
+            self.last_evicted = Some(oldest);
         }
         self.lru.push_back(key);
         self.table.insert(
@@ -351,6 +354,10 @@ impl FlowTable {
         if let Some(stat) = self.stats.get_mut(cpu) {
             stat.add_evicted();
         }
+    }
+
+    pub fn take_last_evicted(&mut self) -> Option<FlowKey> {
+        self.last_evicted.take()
     }
 }
 

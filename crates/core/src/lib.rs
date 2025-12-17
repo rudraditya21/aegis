@@ -2,7 +2,7 @@
 
 use chrono::Timelike;
 use packet_parser::{IpProtocol, ParseError};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
@@ -34,9 +34,9 @@ impl TcpStreamState {
         }
     }
 
-    fn process_segment(&mut self, seq: u32, payload: &[u8], max_buffer: usize) -> Vec<u8> {
+    fn process_segment(&mut self, seq: u32, payload: &[u8], max_buffer: usize) -> (Vec<u8>, bool) {
         if payload.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let mut start = seq;
         let mut data = payload.to_vec();
@@ -47,7 +47,7 @@ impl TcpStreamState {
         {
             let overlap = (expected - seq) as usize;
             if overlap >= data.len() {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             data.drain(0..overlap);
             start = expected;
@@ -76,29 +76,29 @@ impl TcpStreamState {
                         break;
                     }
                 }
-                return out;
+                return (out, false);
             } else if start > expected {
                 // Out-of-order: buffer if within capacity
                 self.buffered_bytes += data.len();
                 if self.buffered_bytes > max_buffer {
                     self.buffered_bytes -= data.len();
-                    return Vec::new();
+                    return (Vec::new(), true);
                 }
                 self.buffer.insert(start, data);
-                return Vec::new();
+                return (Vec::new(), false);
             }
         }
 
         // First packet initializes stream
         if self.next_seq.is_none() {
             if data.len() > max_buffer {
-                return Vec::new();
+                return (Vec::new(), true);
             }
             self.next_seq = Some(start.wrapping_add(data.len() as u32));
-            return data;
+            return (data, false);
         }
         self.next_seq = Some(start.wrapping_add(data.len() as u32));
-        data
+        (data, false)
     }
 }
 
@@ -122,10 +122,14 @@ impl TcpReassembly {
         direction: Direction,
         seq: u32,
         payload: &[u8],
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, bool) {
         let key = (flow, direction);
         let state = self.streams.entry(key).or_insert_with(TcpStreamState::new);
         state.process_segment(seq, payload, self.max_buffer)
+    }
+
+    pub fn set_max_buffer(&mut self, max_buffer: usize) {
+        self.max_buffer = max_buffer.max(1);
     }
 }
 
@@ -978,6 +982,9 @@ pub struct FirewallManager {
     signature_engine: SignatureEngine,
     reassembly: TcpReassembly,
     signature_tails: HashMap<FlowKey, Vec<u8>>,
+    signature_tail_lru: VecDeque<FlowKey>,
+    signature_tail_budget: usize,
+    signature_tail_bytes: usize,
     block_behavior: bool,
     block_signatures: bool,
     block_c2: bool,
@@ -1004,6 +1011,7 @@ pub struct FirewallManager {
     rule_hits: HashMap<u64, u64>,
     time_override: Option<u8>,
     fail_mode: FailMode,
+    backpressure_mode: BackpressureMode,
 }
 
 impl FirewallManager {
@@ -1020,6 +1028,9 @@ impl FirewallManager {
             signature_engine: SignatureEngine::with_default_rules(),
             reassembly: TcpReassembly::new(4096),
             signature_tails: HashMap::new(),
+            signature_tail_lru: VecDeque::new(),
+            signature_tail_budget: 64 * 1024,
+            signature_tail_bytes: 0,
             block_behavior: false,
             block_signatures: true,
             block_c2: false,
@@ -1046,6 +1057,7 @@ impl FirewallManager {
             rule_hits: HashMap::new(),
             time_override: None,
             fail_mode: FailMode::FailClosed,
+            backpressure_mode: BackpressureMode::Drop,
         }
     }
 
@@ -1071,6 +1083,15 @@ impl FirewallManager {
 
     pub fn set_flow_capacity(&mut self, capacity: usize) {
         self.flows.set_capacity(capacity);
+    }
+
+    pub fn set_reassembly_buffer(&mut self, bytes: usize) {
+        self.reassembly.set_max_buffer(bytes);
+    }
+
+    pub fn set_signature_tail_budget(&mut self, bytes: usize) {
+        self.signature_tail_budget = bytes.max(32);
+        self.enforce_signature_tail_budget();
     }
 
     pub fn flow_capacity(&self) -> usize {
@@ -1226,13 +1247,17 @@ impl FirewallManager {
         let mut sig_hits = meta.signatures.clone();
         let mut scan_data: Option<Vec<u8>> = None;
         // Reassemble TCP payloads to detect split signatures.
+        let mut backpressure = false;
         if meta.protocol == IpProtocol::Tcp {
             if let Some(seq) = meta.seq_number {
-                let reassembled =
+                let (reassembled, dropped) =
                     self.reassembly
                         .process(flow_key, meta.direction, seq, &meta.payload);
                 if !reassembled.is_empty() {
                     scan_data = Some(reassembled);
+                }
+                if dropped {
+                    backpressure = true;
                 }
             }
         }
@@ -1258,12 +1283,27 @@ impl FirewallManager {
                     meta.tls = Some(tls);
                 }
             }
-            // Update tail with last 32 bytes for future detections.
+            // Update tail with last 32 bytes for future detections; enforce budget.
             let keep = buf.len().min(32);
-            self.signature_tails
-                .insert(flow_key, buf[buf.len() - keep..].to_vec());
+            let tail = buf[buf.len() - keep..].to_vec();
+            self.insert_signature_tail(flow_key, tail);
         } else {
             self.signature_tails.remove(&flow_key);
+            self.signature_tail_lru.retain(|k| k != &flow_key);
+        }
+        if backpressure {
+            match self.backpressure_mode {
+                BackpressureMode::Drop => {
+                    action = Action::Deny;
+                    blocked_by_protector = true;
+                }
+                BackpressureMode::Bypass => {
+                    sig_hits.clear();
+                }
+                BackpressureMode::LogOnly => {
+                    // keep action; we could add an alert, but keep lightweight
+                }
+            }
         }
         if self.ids_enabled {
             for alert in self.behavior.observe(&meta, &flow, now) {
@@ -1447,6 +1487,10 @@ impl FirewallManager {
         self.fail_mode = mode;
     }
 
+    pub fn set_backpressure_mode(&mut self, mode: BackpressureMode) {
+        self.backpressure_mode = mode;
+    }
+
     fn enrich_metadata(&self, meta: &PacketMetadata) -> PacketMetadata {
         let mut cloned = meta.clone();
         if cloned.user.is_none() {
@@ -1467,6 +1511,30 @@ impl FirewallManager {
             self.alerts.pop_front();
         }
         self.alerts.push_back(alert);
+    }
+
+    fn insert_signature_tail(&mut self, key: FlowKey, tail: Vec<u8>) {
+        if let Some(prev) = self.signature_tails.remove(&key) {
+            self.signature_tail_bytes = self.signature_tail_bytes.saturating_sub(prev.len());
+        }
+        self.signature_tails.insert(key, tail.clone());
+        self.signature_tail_lru.retain(|k| k != &key);
+        self.signature_tail_lru.push_back(key);
+        self.signature_tail_bytes = self.signature_tail_bytes.saturating_add(tail.len());
+        self.enforce_signature_tail_budget();
+    }
+
+    fn enforce_signature_tail_budget(&mut self) {
+        while self.signature_tail_bytes > self.signature_tail_budget {
+            if let Some(old) = self.signature_tail_lru.pop_front() {
+                if let Some(removed) = self.signature_tails.remove(&old) {
+                    self.signature_tail_bytes =
+                        self.signature_tail_bytes.saturating_sub(removed.len());
+                }
+            } else {
+                break;
+            }
+        }
     }
 
     fn matching_rule_id(&self, meta: &PacketMetadata, action: &Action) -> Option<u64> {
@@ -2546,12 +2614,15 @@ mod tests {
             protocol: IpProtocol::Tcp,
         };
         let mut reasm = TcpReassembly::new(4096);
-        let out1 = reasm.process(flow, Direction::Ingress, 1, b"hel");
+        let (out1, dropped1) = reasm.process(flow, Direction::Ingress, 1, b"hel");
+        assert!(!dropped1);
         assert_eq!(out1, b"hel");
         // Out-of-order arrives later
-        let out2 = reasm.process(flow, Direction::Ingress, 7, b"world");
+        let (out2, dropped2) = reasm.process(flow, Direction::Ingress, 7, b"world");
+        assert!(!dropped2);
         assert!(out2.is_empty());
-        let out3 = reasm.process(flow, Direction::Ingress, 4, b"lo ");
+        let (out3, dropped3) = reasm.process(flow, Direction::Ingress, 4, b"lo ");
+        assert!(!dropped3);
         assert_eq!(out3, b"lo world");
     }
 
@@ -2566,8 +2637,10 @@ mod tests {
         };
         let mut reasm = TcpReassembly::new(4);
         // Buffer is small; out-of-order large chunk should be dropped.
-        reasm.process(flow, Direction::Ingress, 10, b"abcdef");
-        let out = reasm.process(flow, Direction::Ingress, 1, b"hi ");
+        let (_drop_buf, dropped) = reasm.process(flow, Direction::Ingress, 10, b"abcdef");
+        assert!(dropped);
+        let (out, dropped2) = reasm.process(flow, Direction::Ingress, 1, b"hi ");
+        assert!(!dropped2);
         assert_eq!(out, b"hi ");
         // No buffered data should have been added due to overflow
         assert!(

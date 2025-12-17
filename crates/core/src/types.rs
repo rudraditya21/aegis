@@ -43,6 +43,7 @@ pub enum BehaviorKind {
     ThreatIntel,
     Beacon,
     Signature,
+    Backpressure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,4 +76,11 @@ pub struct TlsPolicy {
 pub enum FailMode {
     FailOpen,
     FailClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressureMode {
+    Drop,
+    Bypass,
+    LogOnly,
 }

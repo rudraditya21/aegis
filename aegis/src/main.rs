@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use aegis_core::{
-    Action, ApplicationType, BehaviorKind, Cidr, Direction, FailMode, FirewallManager,
-    PacketMetadata, PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject, SignatureEngine,
-    TimeWindow, TlsMetadata, parse_cidr, validate_policies, validate_rules,
+    Action, ApplicationType, BackpressureMode, BehaviorKind, Cidr, Direction, FailMode,
+    FirewallManager, PacketMetadata, PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject,
+    SignatureEngine, TimeWindow, TlsMetadata, parse_cidr, validate_policies, validate_rules,
 };
 use packet_parser::{
     EtherType, IpProtocol, ParseError, parse_ethernet_frame, parse_ipv4_packet, parse_ipv6_packet,
@@ -20,6 +20,27 @@ use tokio::{runtime::Builder, sync::mpsc};
 use utils::{
     config_root, enforce_writable, hex_to_bytes, hex_to_bytes_or_exit, resolve_config_path,
 };
+
+#[derive(Debug, Clone)]
+struct Tuning {
+    flow_capacity: usize,
+    reassembly_buffer: usize,
+    signature_tail_budget: usize,
+    backpressure_mode: BackpressureMode,
+    fail_mode: Option<FailMode>,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            flow_capacity: 65_535,
+            reassembly_buffer: 4096,
+            signature_tail_budget: 64 * 1024,
+            backpressure_mode: BackpressureMode::Drop,
+            fail_mode: None,
+        }
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -195,6 +216,7 @@ fn cmd_eval(args: Vec<String>) -> Result<(), String> {
     let mut disable_geo = false;
     let mut disable_time = false;
     let mut audit_log: Option<String> = None;
+    let mut tuning = Tuning::default();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -221,6 +243,29 @@ fn cmd_eval(args: Vec<String>) -> Result<(), String> {
             "--disable-geo" => disable_geo = true,
             "--disable-time" => disable_time = true,
             "--audit-log" => audit_log = iter.next().cloned(),
+            "--flow-capacity" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--reassembly-buffer" => {
+                if let Some(v) = iter.next() {
+                    tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
+                }
+            }
+            "--signature-tail-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.signature_tail_budget =
+                        v.parse().map_err(|_| "invalid signature tail budget")?;
+                }
+            }
+            "--backpressure" => {
+                if let Some(v) = iter.next() {
+                    tuning.backpressure_mode = parse_backpressure(v)?;
+                }
+            }
+            "--fail-open" => tuning.fail_mode = Some(FailMode::FailOpen),
+            "--fail-closed" => tuning.fail_mode = Some(FailMode::FailClosed),
             other => return Err(format!("Unknown flag {other}")),
         }
     }
@@ -232,7 +277,7 @@ fn cmd_eval(args: Vec<String>) -> Result<(), String> {
     let policies_path = policies_path
         .map(|p| resolve_config_path(&p, false))
         .transpose()?;
-    let mut mgr = load_manager(&rules_path, policies_path.as_deref())?;
+    let mut mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
     if disable_logs {
         mgr.set_logging_enabled(false);
     }
@@ -329,6 +374,7 @@ fn cmd_eval_batch(args: Vec<String>) -> Result<(), String> {
     let mut disable_geo = false;
     let mut disable_time = false;
     let mut disable_logs = true;
+    let mut tuning = Tuning::default();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -348,6 +394,29 @@ fn cmd_eval_batch(args: Vec<String>) -> Result<(), String> {
             "--disable-geo" => disable_geo = true,
             "--disable-time" => disable_time = true,
             "--no-logs" => disable_logs = true,
+            "--flow-capacity" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--reassembly-buffer" => {
+                if let Some(v) = iter.next() {
+                    tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
+                }
+            }
+            "--signature-tail-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.signature_tail_budget =
+                        v.parse().map_err(|_| "invalid signature tail budget")?;
+                }
+            }
+            "--backpressure" => {
+                if let Some(v) = iter.next() {
+                    tuning.backpressure_mode = parse_backpressure(v)?;
+                }
+            }
+            "--fail-open" => tuning.fail_mode = Some(FailMode::FailOpen),
+            "--fail-closed" => tuning.fail_mode = Some(FailMode::FailClosed),
             other => return Err(format!("Unknown flag {other}")),
         }
     }
@@ -380,7 +449,7 @@ fn cmd_eval_batch(args: Vec<String>) -> Result<(), String> {
     let results: Vec<Result<(aegis_core::Evaluation, PacketMetadata), String>> = hex_packets
         .par_iter()
         .map(|line| {
-            let mut mgr = load_manager_from_lines(&lines, &policy_lines)?;
+            let mut mgr = load_manager_from_lines(&lines, &policy_lines, &tuning)?;
             if disable_logs {
                 mgr.set_logging_enabled(false);
             }
@@ -436,6 +505,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     let mut disable_geo = false;
     let mut disable_time = false;
     let mut audit_log: Option<String> = None;
+    let mut tuning = Tuning::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -453,6 +523,29 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
             "--disable-geo" => disable_geo = true,
             "--disable-time" => disable_time = true,
             "--audit-log" => audit_log = iter.next().cloned(),
+            "--flow-capacity" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--reassembly-buffer" => {
+                if let Some(v) = iter.next() {
+                    tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
+                }
+            }
+            "--signature-tail-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.signature_tail_budget =
+                        v.parse().map_err(|_| "invalid signature tail budget")?;
+                }
+            }
+            "--backpressure" => {
+                if let Some(v) = iter.next() {
+                    tuning.backpressure_mode = parse_backpressure(v)?;
+                }
+            }
+            "--fail-open" => tuning.fail_mode = Some(FailMode::FailOpen),
+            "--fail-closed" => tuning.fail_mode = Some(FailMode::FailClosed),
             other => return Err(format!("Unknown flag {other}")),
         }
     }
@@ -463,7 +556,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     let policies_path = policies_path
         .map(|p| resolve_config_path(&p, false))
         .transpose()?;
-    let mut mgr = load_manager(&rules_path, policies_path.as_deref())?;
+    let mut mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
     if disable_logs {
         mgr.set_logging_enabled(false);
     }
@@ -564,6 +657,7 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
     let mut disable_geo = false;
     let mut disable_time = false;
     let mut audit_log: Option<String> = None;
+    let mut tuning = Tuning::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -581,6 +675,29 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
             "--disable-geo" => disable_geo = true,
             "--disable-time" => disable_time = true,
             "--audit-log" => audit_log = iter.next().cloned(),
+            "--flow-capacity" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--reassembly-buffer" => {
+                if let Some(v) = iter.next() {
+                    tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
+                }
+            }
+            "--signature-tail-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.signature_tail_budget =
+                        v.parse().map_err(|_| "invalid signature tail budget")?;
+                }
+            }
+            "--backpressure" => {
+                if let Some(v) = iter.next() {
+                    tuning.backpressure_mode = parse_backpressure(v)?;
+                }
+            }
+            "--fail-open" => tuning.fail_mode = Some(FailMode::FailOpen),
+            "--fail-closed" => tuning.fail_mode = Some(FailMode::FailClosed),
             other => return Err(format!("Unknown flag {other}")),
         }
     }
@@ -596,7 +713,7 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     rt.block_on(async move {
-        let mut mgr = load_manager(&rules_path, policies_path.as_deref())?;
+        let mut mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
         if disable_logs {
             mgr.set_logging_enabled(false);
         }
@@ -666,6 +783,7 @@ fn cmd_replay(args: Vec<String>) -> Result<(), String> {
     let mut disable_time = false;
     let mut audit_log: Option<String> = None;
     let mut block_rate_anomaly = false;
+    let mut tuning = Tuning::default();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -688,6 +806,29 @@ fn cmd_replay(args: Vec<String>) -> Result<(), String> {
             "--disable-time" => disable_time = true,
             "--audit-log" => audit_log = iter.next().cloned(),
             "--block-rate-anomaly" => block_rate_anomaly = true,
+            "--flow-capacity" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--reassembly-buffer" => {
+                if let Some(v) = iter.next() {
+                    tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
+                }
+            }
+            "--signature-tail-budget" => {
+                if let Some(v) = iter.next() {
+                    tuning.signature_tail_budget =
+                        v.parse().map_err(|_| "invalid signature tail budget")?;
+                }
+            }
+            "--backpressure" => {
+                if let Some(v) = iter.next() {
+                    tuning.backpressure_mode = parse_backpressure(v)?;
+                }
+            }
+            "--fail-open" => tuning.fail_mode = Some(FailMode::FailOpen),
+            "--fail-closed" => tuning.fail_mode = Some(FailMode::FailClosed),
             other => return Err(format!("Unknown flag {other}")),
         }
     }
@@ -705,7 +846,7 @@ fn cmd_replay(args: Vec<String>) -> Result<(), String> {
     } else {
         Vec::new()
     };
-    let mut mgr = load_manager_from_lines(&lines, &policy_lines)?;
+    let mut mgr = load_manager_from_lines(&lines, &policy_lines, &tuning)?;
     if disable_logs {
         mgr.set_logging_enabled(false);
     }
@@ -816,7 +957,8 @@ fn cmd_metrics(args: Vec<String>) -> Result<(), String> {
     let policies_path = policies_path
         .map(|p| resolve_config_path(&p, false))
         .transpose()?;
-    let mgr = load_manager(&rules_path, policies_path.as_deref())?;
+    let tuning = Tuning::default();
+    let mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
     let stats = mgr.flow_stats();
     println!(
         "Flow stats packets={} new_flows={} evicted={}",
@@ -875,6 +1017,7 @@ fn cmd_audit_status() -> Result<(), String> {
 fn load_manager(
     rules_path: &std::path::Path,
     policies_path: Option<&std::path::Path>,
+    tuning: &Tuning,
 ) -> Result<FirewallManager, String> {
     let lines = read_rule_lines(rules_path)?;
     let mut parsed_rules = Vec::new();
@@ -883,7 +1026,7 @@ fn load_manager(
         parsed_rules.push(rule);
     }
     validate_rules(&parsed_rules)?;
-    let mut mgr = FirewallManager::new(65535);
+    let mut mgr = FirewallManager::new(tuning.flow_capacity);
     for rule in parsed_rules {
         mgr.add_rule(rule);
     }
@@ -902,13 +1045,18 @@ fn load_manager(
         validate_policies(&entries)?;
         mgr.apply_policy_entries(entries);
     }
-    mgr.set_fail_mode(resolve_fail_mode());
+    mgr.set_reassembly_buffer(tuning.reassembly_buffer);
+    mgr.set_signature_tail_budget(tuning.signature_tail_budget);
+    mgr.set_backpressure_mode(tuning.backpressure_mode);
+    let fail_mode = tuning.fail_mode.unwrap_or_else(resolve_fail_mode);
+    mgr.set_fail_mode(fail_mode);
     Ok(mgr)
 }
 
 fn load_manager_from_lines(
     rules: &[String],
     policies: &[String],
+    tuning: &Tuning,
 ) -> Result<FirewallManager, String> {
     let mut parsed_rules = Vec::new();
     for line in rules {
@@ -916,7 +1064,7 @@ fn load_manager_from_lines(
         parsed_rules.push(rule);
     }
     validate_rules(&parsed_rules)?;
-    let mut mgr = FirewallManager::new(65535);
+    let mut mgr = FirewallManager::new(tuning.flow_capacity);
     for rule in parsed_rules {
         mgr.add_rule(rule);
     }
@@ -935,7 +1083,11 @@ fn load_manager_from_lines(
         validate_policies(&entries)?;
         mgr.apply_policy_entries(entries);
     }
-    mgr.set_fail_mode(resolve_fail_mode());
+    mgr.set_reassembly_buffer(tuning.reassembly_buffer);
+    mgr.set_signature_tail_budget(tuning.signature_tail_budget);
+    mgr.set_backpressure_mode(tuning.backpressure_mode);
+    let fail_mode = tuning.fail_mode.unwrap_or_else(resolve_fail_mode);
+    mgr.set_fail_mode(fail_mode);
     Ok(mgr)
 }
 
@@ -1267,6 +1419,15 @@ fn parse_action(token: Option<&str>) -> Option<Result<Action, String>> {
         }
         Some(other) => Some(Err(format!("unknown action {other}"))),
         None => None,
+    }
+}
+
+fn parse_backpressure(token: &str) -> Result<BackpressureMode, String> {
+    match token.to_ascii_lowercase().as_str() {
+        "drop" => Ok(BackpressureMode::Drop),
+        "bypass" => Ok(BackpressureMode::Bypass),
+        "log" | "log-only" => Ok(BackpressureMode::LogOnly),
+        other => Err(format!("unknown backpressure mode {other}")),
     }
 }
 
