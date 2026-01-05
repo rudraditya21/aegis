@@ -5,15 +5,11 @@ use aegis_core::{
     FirewallManager, PacketMetadata, PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject,
     SignatureEngine, TimeWindow, TlsMetadata, parse_cidr, validate_policies, validate_rules,
 };
-use packet_parser::{
-    EtherType, IpProtocol, ParseError, parse_ethernet_frame, parse_ipv4_packet, parse_ipv6_packet,
-    parse_tcp_segment, parse_udp_datagram,
-};
+use packet_parser::{IpProtocol, ParseError};
 use dataplane::{Dataplane, DataplaneHandle, FrameView};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::{runtime::Builder, sync::mpsc};
@@ -22,6 +18,8 @@ use utils::{
 };
 mod runtime_config;
 use runtime_config::load_runtime_config;
+mod packet_ref;
+use packet_ref::{FrameRef, PacketRef};
 
 #[derive(Debug, Clone)]
 struct Tuning {
@@ -307,7 +305,8 @@ fn cmd_eval(args: Vec<String>) -> Result<(), String> {
         mgr.disable_interface(&name);
     }
     let bytes = hex_to_bytes_or_exit(&hex);
-    let meta = packet_metadata(&bytes, direction).map_err(|e| format!("{e:?}"))?;
+    let capture_payload = capture_payload_enabled(&mgr);
+    let meta = packet_metadata(&bytes, direction, capture_payload).map_err(|e| format!("{e:?}"))?;
     let eval = mgr.evaluate(&meta, iface.as_deref(), Instant::now());
     println!(
         "Action: {:?} (blocked_by_protector={})",
@@ -481,8 +480,10 @@ fn cmd_eval_batch(args: Vec<String>) -> Result<(), String> {
             if disable_time {
                 mgr.set_time_rules_enabled(false);
             }
+            let capture_payload = capture_payload_enabled(&mgr);
             let bytes = hex_to_bytes(line)?;
-            let meta = packet_metadata(&bytes, direction).map_err(|e| format!("{e:?}"))?;
+            let meta =
+                packet_metadata(&bytes, direction, capture_payload).map_err(|e| format!("{e:?}"))?;
             let eval = mgr.evaluate(&meta, None, Instant::now());
             Ok((eval, meta))
         })
@@ -594,6 +595,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     if disable_time {
         mgr.set_time_rules_enabled(false);
     }
+    let capture_payload = capture_payload_enabled(&mgr);
     let runtime = load_runtime_config(&config_root())?;
     let dp_cfg = runtime.dataplane;
     let mut dataplane =
@@ -610,7 +612,10 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     while processed < count {
         match dataplane.next_frame() {
             Ok(Some(pkt)) => {
-                if let Ok(meta) = packet_metadata(pkt.bytes(), Direction::Ingress) {
+                let frame = FrameRef::from_view(&pkt);
+                if let Ok(meta) =
+                    packet_metadata(frame.bytes(), Direction::Ingress, capture_payload)
+                {
                     let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
                     if let Some(path) = &audit_log {
                         let _ = write_audit(path, &meta, &eval);
@@ -763,6 +768,7 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
         if disable_time {
             mgr.set_time_rules_enabled(false);
         }
+        let capture_payload = capture_payload_enabled(&mgr);
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
         let iface_clone = iface.clone();
@@ -795,7 +801,7 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
         });
 
         while let Some(data) = rx.recv().await {
-            if let Ok(meta) = packet_metadata(&data, Direction::Ingress) {
+            if let Ok(meta) = packet_metadata(&data, Direction::Ingress, capture_payload) {
                 let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
                 if let Some(path) = &audit_log {
                     let _ = write_audit(path, &meta, &eval);
@@ -908,6 +914,7 @@ fn cmd_replay(args: Vec<String>) -> Result<(), String> {
     if block_rate_anomaly {
         mgr.set_behavior_blocking(true);
     }
+    let capture_payload = capture_payload_enabled(&mgr);
 
     let file = File::open(&file_path).map_err(|e| format!("open replay file: {e}"))?;
     let reader = BufReader::new(file);
@@ -928,7 +935,7 @@ fn cmd_replay(args: Vec<String>) -> Result<(), String> {
                 continue;
             }
         };
-        let meta = match packet_metadata(&bytes, direction) {
+        let meta = match packet_metadata(&bytes, direction, capture_payload) {
             Ok(m) => m,
             Err(_) => {
                 parse_drops += 1;
@@ -1187,154 +1194,20 @@ fn read_rule_lines(path: &std::path::Path) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-fn packet_metadata(bytes: &[u8], direction: Direction) -> Result<PacketMetadata, ParseError> {
-    let eth = parse_ethernet_frame(bytes)?;
-    match eth.ethertype {
-        EtherType::Ipv4 => {
-            let ip = parse_ipv4_packet(eth.payload)?;
-            let src_ip = IpAddr::V4(Ipv4Addr::from(ip.source));
-            let dst_ip = IpAddr::V4(Ipv4Addr::from(ip.destination));
-            let (src_port, dst_port, tcp_flags, app, tls_meta, sigs, payload, seq) =
-                match ip.protocol {
-                    IpProtocol::Tcp => {
-                        let tcp = parse_tcp_segment(ip.payload)?;
-                        (
-                            Some(tcp.source_port),
-                            Some(tcp.destination_port),
-                            Some(tcp.flags),
-                            detect_application(
-                                IpProtocol::Tcp,
-                                tcp.source_port,
-                                tcp.destination_port,
-                                tcp.payload,
-                            ),
-                            parse_tls_metadata(tcp.payload),
-                            detect_signatures(tcp.payload),
-                            tcp.payload.to_vec(),
-                            Some(tcp.sequence_number),
-                        )
-                    }
-                    IpProtocol::Udp => {
-                        let udp = parse_udp_datagram(ip.payload)?;
-                        (
-                            Some(udp.source_port),
-                            Some(udp.destination_port),
-                            None,
-                            detect_application(
-                                IpProtocol::Udp,
-                                udp.source_port,
-                                udp.destination_port,
-                                udp.payload,
-                            ),
-                            None,
-                            detect_signatures(udp.payload),
-                            udp.payload.to_vec(),
-                            None,
-                        )
-                    }
-                    _ => (
-                        None,
-                        None,
-                        None,
-                        ApplicationType::Unknown,
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                    ),
-                };
-            Ok(PacketMetadata {
-                direction,
-                src_ip,
-                dst_ip,
-                protocol: ip.protocol,
-                src_port,
-                dst_port,
-                tcp_flags,
-                application: app,
-                seq_number: seq,
-                payload,
-                signatures: sigs,
-                user: None,
-                geo: None,
-                tls: tls_meta,
-            })
-        }
-        EtherType::Ipv6 => {
-            let ip = parse_ipv6_packet(eth.payload)?;
-            let src_ip = IpAddr::V6(Ipv6Addr::from(ip.source));
-            let dst_ip = IpAddr::V6(Ipv6Addr::from(ip.destination));
-            let (src_port, dst_port, tcp_flags, app, tls_meta, sigs, payload, seq) =
-                match ip.next_header {
-                    IpProtocol::Tcp => {
-                        let tcp = parse_tcp_segment(ip.payload)?;
-                        (
-                            Some(tcp.source_port),
-                            Some(tcp.destination_port),
-                            Some(tcp.flags),
-                            detect_application(
-                                IpProtocol::Tcp,
-                                tcp.source_port,
-                                tcp.destination_port,
-                                tcp.payload,
-                            ),
-                            parse_tls_metadata(tcp.payload),
-                            detect_signatures(tcp.payload),
-                            tcp.payload.to_vec(),
-                            Some(tcp.sequence_number),
-                        )
-                    }
-                    IpProtocol::Udp => {
-                        let udp = parse_udp_datagram(ip.payload)?;
-                        (
-                            Some(udp.source_port),
-                            Some(udp.destination_port),
-                            None,
-                            detect_application(
-                                IpProtocol::Udp,
-                                udp.source_port,
-                                udp.destination_port,
-                                udp.payload,
-                            ),
-                            None,
-                            detect_signatures(udp.payload),
-                            udp.payload.to_vec(),
-                            None,
-                        )
-                    }
-                    _ => (
-                        None,
-                        None,
-                        None,
-                        ApplicationType::Unknown,
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                    ),
-                };
-            Ok(PacketMetadata {
-                direction,
-                src_ip,
-                dst_ip,
-                protocol: ip.next_header,
-                src_port,
-                dst_port,
-                tcp_flags,
-                application: app,
-                seq_number: seq,
-                payload,
-                signatures: sigs,
-                user: None,
-                geo: None,
-                tls: tls_meta,
-            })
-        }
-        _ => Err(ParseError::Unsupported("non-ip ethertype")),
-    }
+fn packet_metadata(
+    bytes: &[u8],
+    direction: Direction,
+    capture_payload: bool,
+) -> Result<PacketMetadata, ParseError> {
+    let packet = PacketRef::parse(bytes, direction)?;
+    Ok(packet.materialize(capture_payload))
 }
 
-fn detect_application(
+fn capture_payload_enabled(mgr: &FirewallManager) -> bool {
+    mgr.ids_enabled() || mgr.ips_enabled()
+}
+
+pub(crate) fn detect_application(
     proto: IpProtocol,
     src_port: u16,
     dst_port: u16,
@@ -1345,13 +1218,7 @@ fn detect_application(
     engine.detect_application(proto, src_port, dst_port, payload)
 }
 
-fn detect_signatures(payload: &[u8]) -> Vec<String> {
-    static SIGNATURE_ENGINE: OnceLock<SignatureEngine> = OnceLock::new();
-    let engine = SIGNATURE_ENGINE.get_or_init(SignatureEngine::with_default_rules);
-    engine.scan_exploits(payload)
-}
-
-fn parse_tls_metadata(payload: &[u8]) -> Option<TlsMetadata> {
+pub(crate) fn parse_tls_metadata(payload: &[u8]) -> Option<TlsMetadata> {
     if payload.len() < 6 {
         return None;
     }

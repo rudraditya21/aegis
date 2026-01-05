@@ -1319,92 +1319,98 @@ impl FirewallManager {
         let mut scan_data: Option<Vec<u8>> = None;
         // Reassemble TCP payloads to detect split signatures.
         let mut backpressure = false;
-        if meta.protocol == IpProtocol::Tcp {
-            if let Some(seq) = meta.seq_number {
-                let (reassembled, dropped) =
-                    self.reassembly
-                        .process(flow_key, meta.direction, seq, &meta.payload);
-                if !reassembled.is_empty() {
-                    scan_data = Some(reassembled);
-                }
-                if dropped {
-                    backpressure = true;
-                }
-            }
-        }
-        // Default to direct payload if no reassembly data.
-        if scan_data.is_none() && !meta.payload.is_empty() {
-            scan_data = Some(meta.payload.clone());
-        }
-        if let Some(data) = &scan_data {
-            // Prepend tail from this flow to catch boundary-crossing patterns.
-            let mut buf = Vec::new();
-            if let Some(tail) = self.signature_tails.get(&flow_key) {
-                buf.extend_from_slice(tail);
-            }
-            buf.extend_from_slice(data);
-            let scratch_needed = buf.len().saturating_mul(2);
-            let mut scratch_claimed = false;
-            if self.dpi_scratch_in_use + scratch_needed <= self.dpi_scratch_budget {
-                self.dpi_scratch_in_use += scratch_needed;
-                scratch_claimed = true;
-                // Scan raw and normalized encodings.
-                sig_hits = self.signature_engine.scan_exploits(&buf);
-                let norm = normalize_payload(&buf);
-                let mut norm_hits = self.signature_engine.scan_exploits(&norm);
-                sig_hits.append(&mut norm_hits);
-                // Update TLS metadata from reassembled payload if present.
-                if meta.tls.is_none() {
-                    if let Some(tls) = parse_tls_metadata(&buf) {
-                        meta.tls = Some(tls);
+        if self.ids_enabled || self.ips_enabled {
+            if meta.protocol == IpProtocol::Tcp {
+                if let Some(seq) = meta.seq_number {
+                    let (reassembled, dropped) =
+                        self.reassembly
+                            .process(flow_key, meta.direction, seq, &meta.payload);
+                    if !reassembled.is_empty() {
+                        scan_data = Some(reassembled);
+                    }
+                    if dropped {
+                        backpressure = true;
                     }
                 }
-                // Update tail with last 32 bytes for future detections; enforce budget.
-                let keep = buf.len().min(32);
-                let tail = buf[buf.len() - keep..].to_vec();
-                self.insert_signature_tail(flow_key, tail);
-            } else {
-                backpressure = true;
             }
-            if scratch_claimed {
-                self.dpi_scratch_in_use = self.dpi_scratch_in_use.saturating_sub(scratch_needed);
+            // Default to direct payload if no reassembly data.
+            if scan_data.is_none() && !meta.payload.is_empty() {
+                scan_data = Some(meta.payload.clone());
+            }
+            if let Some(data) = &scan_data {
+                // Prepend tail from this flow to catch boundary-crossing patterns.
+                let mut buf = Vec::new();
+                if let Some(tail) = self.signature_tails.get(&flow_key) {
+                    buf.extend_from_slice(tail);
+                }
+                buf.extend_from_slice(data);
+                let scratch_needed = buf.len().saturating_mul(2);
+                let mut scratch_claimed = false;
+                if self.dpi_scratch_in_use + scratch_needed <= self.dpi_scratch_budget {
+                    self.dpi_scratch_in_use += scratch_needed;
+                    scratch_claimed = true;
+                    // Scan raw and normalized encodings.
+                    sig_hits = self.signature_engine.scan_exploits(&buf);
+                    let norm = normalize_payload(&buf);
+                    let mut norm_hits = self.signature_engine.scan_exploits(&norm);
+                    sig_hits.append(&mut norm_hits);
+                    // Update TLS metadata from reassembled payload if present.
+                    if meta.tls.is_none() {
+                        if let Some(tls) = parse_tls_metadata(&buf) {
+                            meta.tls = Some(tls);
+                        }
+                    }
+                    // Update tail with last 32 bytes for future detections; enforce budget.
+                    let keep = buf.len().min(32);
+                    let tail = buf[buf.len() - keep..].to_vec();
+                    self.insert_signature_tail(flow_key, tail);
+                } else {
+                    backpressure = true;
+                }
+                if scratch_claimed {
+                    self.dpi_scratch_in_use =
+                        self.dpi_scratch_in_use.saturating_sub(scratch_needed);
+                }
+            } else {
+                self.signature_tails.remove(&flow_key);
+                self.signature_tail_lru.retain(|k| k != &flow_key);
+            }
+            if backpressure {
+                match self.backpressure_mode {
+                    BackpressureMode::Drop => {
+                        action = Action::Deny;
+                        blocked_by_protector = true;
+                        if self.ids_enabled {
+                            self.push_resource_alert(
+                                BehaviorKind::Backpressure,
+                                meta.src_ip,
+                                Some(meta.dst_ip),
+                                meta.dst_port,
+                                1,
+                                now,
+                            );
+                        }
+                    }
+                    BackpressureMode::Bypass => {
+                        sig_hits.clear();
+                    }
+                    BackpressureMode::LogOnly => {
+                        if self.ids_enabled {
+                            self.push_resource_alert(
+                                BehaviorKind::Backpressure,
+                                meta.src_ip,
+                                Some(meta.dst_ip),
+                                meta.dst_port,
+                                1,
+                                now,
+                            );
+                        }
+                    }
+                }
             }
         } else {
             self.signature_tails.remove(&flow_key);
             self.signature_tail_lru.retain(|k| k != &flow_key);
-        }
-        if backpressure {
-            match self.backpressure_mode {
-                BackpressureMode::Drop => {
-                    action = Action::Deny;
-                    blocked_by_protector = true;
-                    if self.ids_enabled {
-                        self.push_resource_alert(
-                            BehaviorKind::Backpressure,
-                            meta.src_ip,
-                            Some(meta.dst_ip),
-                            meta.dst_port,
-                            1,
-                            now,
-                        );
-                    }
-                }
-                BackpressureMode::Bypass => {
-                    sig_hits.clear();
-                }
-                BackpressureMode::LogOnly => {
-                    if self.ids_enabled {
-                        self.push_resource_alert(
-                            BehaviorKind::Backpressure,
-                            meta.src_ip,
-                            Some(meta.dst_ip),
-                            meta.dst_port,
-                            1,
-                            now,
-                        );
-                    }
-                }
-            }
         }
         if self.ids_enabled {
             for alert in self.behavior.observe(&meta, &flow, now) {
@@ -1440,6 +1446,8 @@ impl FirewallManager {
         if self.block_behavior && (rate_alert_seen || beacon_alert_seen) {
             action = Action::Deny;
         }
+
+        meta.signatures = sig_hits;
 
         match action {
             Action::Allow => self.counters.allowed += 1,
