@@ -201,3 +201,132 @@ impl<'a> PacketRef<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dataplane::FrameView;
+
+    struct DummyFrame<'a> {
+        data: &'a [u8],
+    }
+
+    impl FrameView for DummyFrame<'_> {
+        fn bytes(&self) -> &[u8] {
+            self.data
+        }
+
+        fn timestamp(&self) -> Option<std::time::SystemTime> {
+            None
+        }
+    }
+
+    fn build_ipv4_udp_frame(payload: &[u8], src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0u8; 6]); // dst mac
+        frame.extend_from_slice(&[1u8; 6]); // src mac
+        frame.extend_from_slice(&[0x08, 0x00]); // ethertype ipv4
+
+        let total_len = 20 + 8 + payload.len();
+        let mut ipv4 = [0u8; 20];
+        ipv4[0] = 0x45; // v4, ihl=5
+        ipv4[1] = 0x00; // dscp/ecn
+        ipv4[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        ipv4[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
+        ipv4[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags (DF)
+        ipv4[8] = 64; // ttl
+        ipv4[9] = 17; // udp
+        ipv4[10..12].copy_from_slice(&0u16.to_be_bytes()); // checksum
+        ipv4[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        ipv4[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        frame.extend_from_slice(&ipv4);
+
+        let udp_len = 8 + payload.len();
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        udp[6..8].copy_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&udp);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn build_ipv6_tcp_frame(payload: &[u8], src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0u8; 6]); // dst mac
+        frame.extend_from_slice(&[1u8; 6]); // src mac
+        frame.extend_from_slice(&[0x86, 0xDD]); // ethertype ipv6
+
+        let payload_len = 20 + payload.len();
+        let mut ipv6 = [0u8; 40];
+        ipv6[0] = 0x60; // version 6
+        ipv6[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        ipv6[6] = 6; // tcp
+        ipv6[7] = 64; // hop limit
+        ipv6[8..24].copy_from_slice(&[0u8; 16]); // src
+        ipv6[24..40].copy_from_slice(&[1u8; 16]); // dst
+        frame.extend_from_slice(&ipv6);
+
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&1u32.to_be_bytes()); // seq
+        tcp[8..12].copy_from_slice(&0u32.to_be_bytes()); // ack
+        tcp[12] = 0x50; // data offset=5
+        tcp[13] = 0x18; // psh+ack
+        tcp[14..16].copy_from_slice(&1024u16.to_be_bytes()); // window
+        tcp[16..18].copy_from_slice(&0u16.to_be_bytes()); // checksum
+        tcp[18..20].copy_from_slice(&0u16.to_be_bytes()); // urg ptr
+        frame.extend_from_slice(&tcp);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn parse_ipv4_udp_packet_ref() {
+        let mut dns = [0u8; 12];
+        dns[4] = 0;
+        dns[5] = 1; // qdcount
+        dns[6] = 0;
+        dns[7] = 0; // ancount
+        let frame = build_ipv4_udp_frame(&dns, 5353, 53);
+        let packet = PacketRef::parse(&frame, Direction::Ingress).unwrap();
+        assert_eq!(packet.protocol, IpProtocol::Udp);
+        assert_eq!(packet.src_port, Some(5353));
+        assert_eq!(packet.dst_port, Some(53));
+        assert_eq!(packet.payload, dns);
+        assert_eq!(packet.application, ApplicationType::Dns);
+    }
+
+    #[test]
+    fn parse_ipv6_tcp_packet_ref() {
+        let payload = b"GET / HTTP/1.1\r\n";
+        let frame = build_ipv6_tcp_frame(payload, 12345, 80);
+        let packet = PacketRef::parse(&frame, Direction::Ingress).unwrap();
+        assert_eq!(packet.protocol, IpProtocol::Tcp);
+        assert_eq!(packet.src_port, Some(12345));
+        assert_eq!(packet.dst_port, Some(80));
+        assert_eq!(packet.payload, payload);
+        assert_eq!(packet.application, ApplicationType::Http);
+    }
+
+    #[test]
+    fn materialize_payload_toggle() {
+        let payload = b"payload";
+        let frame = build_ipv4_udp_frame(payload, 1000, 2000);
+        let packet = PacketRef::parse(&frame, Direction::Ingress).unwrap();
+        let meta_no = packet.clone().materialize(false);
+        let meta_yes = packet.materialize(true);
+        assert!(meta_no.payload.is_empty());
+        assert_eq!(meta_yes.payload, payload);
+    }
+
+    #[test]
+    fn frameref_from_view() {
+        let data = [1u8, 2, 3, 4];
+        let frame = DummyFrame { data: &data };
+        let view = FrameRef::from_view(&frame);
+        assert_eq!(view.bytes(), &data);
+    }
+}

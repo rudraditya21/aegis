@@ -267,3 +267,36 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> String {
 unsafe fn err_from_handle(handle: *mut pcap_t) -> String {
     unsafe { cstr_to_string(pcap_geterr(handle)) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn capture_is_send_sync() {
+        assert_send_sync::<Capture>();
+    }
+
+    #[test]
+    fn device_equality_and_clone() {
+        let a = Device {
+            name: "eth0".to_string(),
+            description: Some("primary".to_string()),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stats_copy_and_compare() {
+        let a = Stats {
+            received: 1,
+            dropped: 2,
+            if_dropped: 3,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+}

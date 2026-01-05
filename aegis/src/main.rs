@@ -1592,6 +1592,18 @@ mod tests {
     }
 
     #[test]
+    fn capture_payload_enabled_tracks_ids_ips() {
+        let mut mgr = FirewallManager::new(128);
+        assert!(capture_payload_enabled(&mgr));
+        mgr.set_ids_enabled(false);
+        assert!(capture_payload_enabled(&mgr));
+        mgr.set_ips_enabled(false);
+        assert!(!capture_payload_enabled(&mgr));
+        mgr.set_ids_enabled(true);
+        assert!(capture_payload_enabled(&mgr));
+    }
+
+    #[test]
     fn policy_parser_parses_conditions() {
         let (prio, action, cond) = parse_policy_line(
             "priority 10 action allow src 10.0.0.0/8 app http user alice geo US time 9-17",

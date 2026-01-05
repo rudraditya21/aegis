@@ -88,3 +88,49 @@ pub fn hex_to_bytes_or_exit(input: &str) -> Vec<u8> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn hex_to_bytes_accepts_basic_cases() {
+        assert_eq!(hex_to_bytes("00").unwrap(), vec![0x00]);
+        assert_eq!(hex_to_bytes("0A ff").unwrap(), vec![0x0A, 0xFF]);
+        assert!(hex_to_bytes("0G").is_err());
+        assert!(hex_to_bytes("abc").is_err());
+    }
+
+    #[test]
+    fn resolve_config_path_rejects_outside_root() {
+        let outside = std::env::temp_dir().join("outside.txt");
+        let err = resolve_config_path(outside.to_str().unwrap(), false).unwrap_err();
+        assert!(err.contains("must reside under config root"));
+    }
+
+    #[test]
+    fn resolve_config_path_accepts_rooted_path() {
+        let root = config_root();
+        let root_canon = if root.exists() {
+            root.canonicalize().unwrap_or_else(|_| root.clone())
+        } else {
+            root.clone()
+        };
+        let rooted = root.join("rules.txt");
+        let resolved = resolve_config_path(rooted.to_str().unwrap(), false).unwrap();
+        assert!(resolved.starts_with(root_canon));
+    }
+
+    #[test]
+    fn enforce_writable_respects_readonly_permissions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cfg.txt");
+        std::fs::write(&path, b"data").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let err = enforce_writable(&path).unwrap_err();
+        assert!(err.contains("read-only"));
+    }
+}

@@ -46,6 +46,9 @@ dependencies = [
 [[package]]
 name = "aegis-utils"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "aho-corasick"

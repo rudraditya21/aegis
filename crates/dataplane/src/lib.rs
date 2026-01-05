@@ -327,3 +327,44 @@ impl Dataplane for DataplaneHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_pcap_backend() {
+        let cfg = DataplaneConfig::default();
+        assert_eq!(cfg.backend, BackendKind::Pcap);
+        assert!(cfg.pcap.is_some());
+    }
+
+    #[test]
+    fn pcap_config_falls_back_to_default() {
+        let mut cfg = DataplaneConfig::default();
+        cfg.pcap = None;
+        let pcap = cfg.pcap_config();
+        assert_eq!(pcap.snaplen, 65535);
+        assert!(pcap.promisc);
+        assert_eq!(pcap.timeout_ms, 1_000);
+    }
+
+    #[test]
+    fn rss_defaults_cover_common_fields() {
+        let rss = RssConfig::default();
+        assert!(rss.enabled);
+        assert!(rss.hash_fields.contains(&RssHashField::Ipv4));
+        assert!(rss.hash_fields.contains(&RssHashField::Tcp));
+    }
+
+    #[test]
+    fn unsupported_backend_reports_error() {
+        let mut cfg = DataplaneConfig::default();
+        cfg.backend = BackendKind::AfXdp;
+        let err = DataplaneHandle::open_live("eth0", &cfg).unwrap_err();
+        match err {
+            DataplaneError::Unsupported(_) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}
