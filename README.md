@@ -15,7 +15,7 @@ High-performance Rust firewall/IDS workspace with persistent configuration under
 ## Quick Start
 
 - Config root: defaults to `/etc/aegis` (override with `AEGIS_CONFIG_ROOT`). Layout:
-  - `aegis.yaml` (optional), `rules/l3l4.rules`, `rules/dpi.rules`, `rules/policies.rules`
+  - `aegis.yaml` (runtime config, optional), `rules/l3l4.rules`, `rules/dpi.rules`, `rules/policies.rules`
   - `intel/ip_blocklist.txt`, `intel/domain_blocklist.txt`
   - `state/flows.snapshot`, `state/counters.bin`, `state/versions/` (backups)
   - `logs/alerts.log`, `logs/dpi.log`, `logs/audit.log`
@@ -26,6 +26,23 @@ High-performance Rust firewall/IDS workspace with persistent configuration under
 - Capture (pcap): `cargo run -p aegis -- capture --rules /etc/aegis/rules/l3l4.rules --iface eth0 --count 10`
 - Fail mode: default fail-closed when no rules loaded; set `AEGIS_FAIL_OPEN=1` to start in fail-open.
 - Docker: `docker build -t aegis . && docker run --rm aegis`
+
+### Runtime Config (aegis.yaml)
+
+Example:
+```yaml
+dataplane:
+  backend: pcap
+  pcap:
+    snaplen: 65535
+    promisc: true
+    timeout-ms: 1000
+    filter: "tcp and port 443"
+  rss:
+    enabled: false
+```
+
+Supported backends: `pcap` (default). `af-xdp` and `dpdk` are parsed but require compiled backends.
 
 ### Rule File Format
 

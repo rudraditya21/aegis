@@ -9,7 +9,7 @@ use packet_parser::{
     EtherType, IpProtocol, ParseError, parse_ethernet_frame, parse_ipv4_packet, parse_ipv6_packet,
     parse_tcp_segment, parse_udp_datagram,
 };
-use pcap_shim::Capture;
+use dataplane::{Dataplane, DataplaneHandle, FrameView};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +20,8 @@ use tokio::{runtime::Builder, sync::mpsc};
 use utils::{
     config_root, enforce_writable, hex_to_bytes, hex_to_bytes_or_exit, resolve_config_path,
 };
+mod runtime_config;
+use runtime_config::load_runtime_config;
 
 #[derive(Debug, Clone)]
 struct Tuning {
@@ -592,14 +594,23 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     if disable_time {
         mgr.set_time_rules_enabled(false);
     }
-    let mut cap =
-        Capture::open_live(iface.as_str(), 65535, true, 1_000).map_err(|e| format!("pcap: {e}"))?;
+    let runtime = load_runtime_config(&config_root())?;
+    let dp_cfg = runtime.dataplane;
+    let mut dataplane =
+        DataplaneHandle::open_live(iface.as_str(), &dp_cfg).map_err(|e| format!("dataplane: {e}"))?;
+    if let Some(rss) = dp_cfg.rss.as_ref() {
+        if rss.enabled {
+            dataplane
+                .configure_rss(rss)
+                .map_err(|e| format!("dataplane rss: {e}"))?;
+        }
+    }
 
     let mut processed = 0usize;
     while processed < count {
-        match cap.next() {
+        match dataplane.next_frame() {
             Ok(Some(pkt)) => {
-                if let Ok(meta) = packet_metadata(pkt.data, Direction::Ingress) {
+                if let Ok(meta) = packet_metadata(pkt.bytes(), Direction::Ingress) {
                     let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
                     if let Some(path) = &audit_log {
                         let _ = write_audit(path, &meta, &eval);
@@ -608,7 +619,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
                 }
             }
             Ok(None) => continue,
-            Err(e) => return Err(format!("pcap read: {e}")),
+            Err(e) => return Err(format!("dataplane read: {e}")),
         }
     }
     println!(
@@ -727,6 +738,9 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
         .transpose()?;
     let iface = iface.ok_or("Missing --iface <name>")?;
 
+    let runtime_cfg = load_runtime_config(&config_root())?;
+    let dp_cfg = runtime_cfg.dataplane;
+
     let rt = Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -752,20 +766,29 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
         let iface_clone = iface.clone();
+        let dp_cfg_reader = dp_cfg.clone();
         let reader = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let mut cap = Capture::open_live(iface_clone.as_str(), 65535, true, 1_000)
-                .map_err(|e| format!("pcap: {e}"))?;
+            let mut dataplane =
+                DataplaneHandle::open_live(&iface_clone, &dp_cfg_reader)
+                    .map_err(|e| format!("dataplane: {e}"))?;
+            if let Some(rss) = dp_cfg_reader.rss.as_ref() {
+                if rss.enabled {
+                    dataplane
+                        .configure_rss(rss)
+                        .map_err(|e| format!("dataplane rss: {e}"))?;
+                }
+            }
             let mut processed = 0usize;
             while processed < count {
-                match cap.next() {
+                match dataplane.next_frame() {
                     Ok(Some(pkt)) => {
-                        if tx.blocking_send(pkt.data.to_vec()).is_err() {
+                        if tx.blocking_send(pkt.bytes().to_vec()).is_err() {
                             break;
                         }
                         processed += 1;
                     }
                     Ok(None) => continue,
-                    Err(e) => return Err(format!("pcap read: {e}")),
+                    Err(e) => return Err(format!("dataplane read: {e}")),
                 }
             }
             Ok(())

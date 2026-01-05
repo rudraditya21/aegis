@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 packet-parser = { path = "../crates/packet-parser" }
 aegis-core = { path = "../crates/core" }
-pcap-shim = { path = "../crates/pcap-shim" }
+dataplane = { package = "aegis-dataplane", path = "../crates/dataplane" }
 utils = { package = "aegis-utils", path = "../crates/utils" }
 rayon = "1.10"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
