@@ -39,7 +39,12 @@ dataplane:
     timeout-ms: 1000
     filter: "tcp and port 443"
   rss:
-    enabled: false
+    enabled: true
+    symmetric: true
+    hash-fields: ["ipv4", "ipv6", "tcp", "udp"]
+    queues: [0, 1]
+    cpu-affinity: [2, 3]
+    seed: 42
 ```
 
 AF_XDP example (Linux only, feature-gated):
@@ -69,6 +74,8 @@ dataplane:
   backend: dpdk
   dpdk:
     port-id: 0
+    rx-queue: 0
+    tx-queue: 0
     rx-queues: 1
     tx-queues: 1
     mbuf-count: 8192
@@ -85,6 +92,8 @@ dataplane:
 ```
 
 Supported backends: `pcap` (default). `af-xdp` and `dpdk` require compiled backends (feature flags) and Linux support.
+When `rss.enabled` is true, aegis uses RSS hashing for flow sharding. On RSS-capable backends it
+spawns queue-affine workers; for pcap it uses software hashing to shard flows across workers.
 
 ### Rule File Format
 

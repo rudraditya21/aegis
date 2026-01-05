@@ -144,6 +144,8 @@ pub enum AfXdpMode {
 #[cfg_attr(feature = "serde", serde(default, rename_all = "kebab-case"))]
 pub struct DpdkConfig {
     pub port_id: Option<u16>,
+    pub rx_queue: Option<u16>,
+    pub tx_queue: Option<u16>,
     pub rx_queues: u16,
     pub tx_queues: u16,
     pub mbuf_count: usize,
@@ -165,6 +167,8 @@ impl Default for DpdkConfig {
     fn default() -> Self {
         DpdkConfig {
             port_id: None,
+            rx_queue: None,
+            tx_queue: None,
             rx_queues: 1,
             tx_queues: 1,
             mbuf_count: 8192,
@@ -193,6 +197,7 @@ pub struct RssConfig {
     pub hash_fields: Vec<RssHashField>,
     pub seed: Option<u64>,
     pub queues: Option<Vec<u16>>,
+    pub cpu_affinity: Option<Vec<usize>>,
 }
 
 impl Default for RssConfig {
@@ -208,6 +213,7 @@ impl Default for RssConfig {
             ],
             seed: None,
             queues: None,
+            cpu_affinity: None,
         }
     }
 }
@@ -424,6 +430,8 @@ impl DataplaneHandle {
                     let dpdk_cfg = cfg.dpdk.clone().unwrap_or_default();
                     let inner_cfg = aegis_dpdk::DpdkConfig {
                         port_id: dpdk_cfg.port_id,
+                        rx_queue: dpdk_cfg.rx_queue,
+                        tx_queue: dpdk_cfg.tx_queue,
                         rx_queues: dpdk_cfg.rx_queues,
                         tx_queues: dpdk_cfg.tx_queues,
                         mbuf_count: dpdk_cfg.mbuf_count,
@@ -560,6 +568,7 @@ mod tests {
         assert!(rss.enabled);
         assert!(rss.hash_fields.contains(&RssHashField::Ipv4));
         assert!(rss.hash_fields.contains(&RssHashField::Tcp));
+        assert!(rss.cpu_affinity.is_none());
     }
 
     #[test]

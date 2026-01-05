@@ -1,18 +1,26 @@
 #![forbid(unsafe_code)]
 
 use aegis_core::{
-    Action, ApplicationType, BackpressureMode, BehaviorKind, Cidr, Direction, FailMode,
-    FirewallManager, PacketMetadata, PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject,
-    SignatureEngine, TimeWindow, TlsMetadata, parse_cidr, validate_policies, validate_rules,
+    Action, ApplicationType, BackpressureMode, BehaviorAlert, BehaviorKind, Cidr, Direction,
+    FailMode, FirewallCounters, FirewallManager, FlowSnapshot, FlowStats, PacketMetadata,
+    PolicyCondition, PolicyEntry, PortRange, Rule, RuleSubject, SignatureEngine, TimeWindow,
+    TlsMetadata, parse_cidr, validate_policies, validate_rules,
 };
 use packet_parser::{IpProtocol, ParseError};
-use dataplane::{Dataplane, DataplaneHandle, FrameView};
+use dataplane::{
+    BackendKind, Dataplane, DataplaneConfig, DataplaneHandle, FrameView,
+    RssConfig,
+};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::thread;
 use std::time::Instant;
-use tokio::{runtime::Builder, sync::mpsc};
 use utils::{
     config_root, enforce_writable, hex_to_bytes, hex_to_bytes_or_exit, resolve_config_path,
 };
@@ -20,6 +28,8 @@ mod runtime_config;
 use runtime_config::load_runtime_config;
 mod packet_ref;
 use packet_ref::{FrameRef, PacketRef};
+mod rss;
+use rss::FlowSharder;
 
 #[derive(Debug, Clone)]
 struct Tuning {
@@ -42,6 +52,36 @@ impl Default for Tuning {
             dpi_scratch_budget: 256 * 1024,
         }
     }
+}
+
+#[derive(Debug)]
+struct WorkerSummary {
+    counters: FirewallCounters,
+    flow_stats: FlowStats,
+    flows: Vec<FlowSnapshot>,
+    alerts: Vec<BehaviorAlert>,
+    suspicious: Vec<FlowSnapshot>,
+    rule_hits: HashMap<u64, u64>,
+    proto_counters: HashMap<IpProtocol, u64>,
+}
+
+#[derive(Debug)]
+struct CaptureSummary {
+    processed: usize,
+    counters: FirewallCounters,
+    flow_stats: FlowStats,
+    flows: Vec<FlowSnapshot>,
+    alerts: Vec<BehaviorAlert>,
+    suspicious: Vec<FlowSnapshot>,
+    rule_hits: HashMap<u64, u64>,
+    proto_counters: HashMap<IpProtocol, u64>,
+}
+
+#[derive(Debug)]
+enum ShardPlan {
+    Single,
+    PerQueue { queues: Vec<u16> },
+    Software { workers: usize },
 }
 
 fn main() {
@@ -579,68 +619,36 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     let policies_path = policies_path
         .map(|p| resolve_config_path(&p, false))
         .transpose()?;
-    let mut mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
-    if disable_logs {
-        mgr.set_logging_enabled(false);
-    }
-    if disable_ids {
-        mgr.set_ids_enabled(false);
-    }
-    if disable_ips {
-        mgr.set_ips_enabled(false);
-    }
-    if disable_geo {
-        mgr.set_geo_rules_enabled(false);
-    }
-    if disable_time {
-        mgr.set_time_rules_enabled(false);
-    }
-    let capture_payload = capture_payload_enabled(&mgr);
     let runtime = load_runtime_config(&config_root())?;
     let dp_cfg = runtime.dataplane;
-    let mut dataplane =
-        DataplaneHandle::open_live(iface.as_str(), &dp_cfg).map_err(|e| format!("dataplane: {e}"))?;
-    if let Some(rss) = dp_cfg.rss.as_ref() {
-        if rss.enabled {
-            dataplane
-                .configure_rss(rss)
-                .map_err(|e| format!("dataplane rss: {e}"))?;
-        }
-    }
-
-    let mut processed = 0usize;
-    while processed < count {
-        match dataplane.next_frame() {
-            Ok(Some(pkt)) => {
-                let frame = FrameRef::from_view(&pkt);
-                if let Ok(meta) =
-                    packet_metadata(frame.bytes(), Direction::Ingress, capture_payload)
-                {
-                    let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
-                    if let Some(path) = &audit_log {
-                        let _ = write_audit(path, &meta, &eval);
-                    }
-                    processed += 1;
-                }
-            }
-            Ok(None) => continue,
-            Err(e) => return Err(format!("dataplane read: {e}")),
-        }
-    }
+    let summary = run_capture_pipeline(
+        iface.as_str(),
+        &rules_path,
+        policies_path.as_deref(),
+        &tuning,
+        dp_cfg,
+        count,
+        audit_log.as_deref(),
+        disable_logs,
+        disable_ids,
+        disable_ips,
+        disable_geo,
+        disable_time,
+    )?;
     println!(
         "Capture finished: processed={} allowed={} dropped={}",
-        processed,
-        mgr.counters().allowed,
-        mgr.counters().dropped
+        summary.processed,
+        summary.counters.allowed,
+        summary.counters.dropped
     );
     println!(
         "Flow stats: packets={} new_flows={} evicted={}",
-        mgr.flow_stats().packets,
-        mgr.flow_stats().new_flows,
-        mgr.flow_stats().evicted
+        summary.flow_stats.packets,
+        summary.flow_stats.new_flows,
+        summary.flow_stats.evicted
     );
-    println!("Protocol counters: {:?}", mgr.protocol_counters());
-    for snap in mgr.flows() {
+    println!("Protocol counters: {:?}", summary.proto_counters);
+    for snap in summary.flows {
         println!(
             "Flow {:?}:{:?} -> {:?}:{:?} proto={:?} state={:?}",
             snap.key.src_ip,
@@ -651,16 +659,16 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
             snap.state
         );
     }
-    if !mgr.alerts(None).is_empty() {
+    if !summary.alerts.is_empty() {
         println!("Alerts:");
-        for alert in mgr.alerts(Some(100)) {
+        for alert in summary.alerts.into_iter().take(100) {
             println!(
                 "- {:?} src={} dst={:?} port={:?} count={} at {:?}",
                 alert.kind, alert.src, alert.dst, alert.port, alert.count, alert.timestamp
             );
         }
     }
-    let susp = mgr.suspicious_flows();
+    let susp = summary.suspicious;
     if !susp.is_empty() {
         println!("Suspicious flows:");
         for snap in susp {
@@ -675,7 +683,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
             );
         }
     }
-    let rule_hits = mgr.rule_hits();
+    let rule_hits = summary.rule_hits;
     if !rule_hits.is_empty() {
         println!("Rule hit counters: {:?}", rule_hits);
     }
@@ -745,78 +753,592 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
 
     let runtime_cfg = load_runtime_config(&config_root())?;
     let dp_cfg = runtime_cfg.dataplane;
+    let summary = run_capture_pipeline(
+        iface.as_str(),
+        &rules_path,
+        policies_path.as_deref(),
+        &tuning,
+        dp_cfg,
+        count,
+        audit_log.as_deref(),
+        disable_logs,
+        disable_ids,
+        disable_ips,
+        disable_geo,
+        disable_time,
+    )?;
+    println!(
+        "Async capture finished: allowed={} dropped={} flows={}",
+        summary.counters.allowed,
+        summary.counters.dropped,
+        summary.flows.len()
+    );
+    Ok(())
+}
 
-    let rt = Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
+fn build_manager(
+    rules_path: &std::path::Path,
+    policies_path: Option<&std::path::Path>,
+    tuning: &Tuning,
+    disable_logs: bool,
+    disable_ids: bool,
+    disable_ips: bool,
+    disable_geo: bool,
+    disable_time: bool,
+) -> Result<FirewallManager, String> {
+    let mut mgr = load_manager(rules_path, policies_path, tuning)?;
+    if disable_logs {
+        mgr.set_logging_enabled(false);
+    }
+    if disable_ids {
+        mgr.set_ids_enabled(false);
+    }
+    if disable_ips {
+        mgr.set_ips_enabled(false);
+    }
+    if disable_geo {
+        mgr.set_geo_rules_enabled(false);
+    }
+    if disable_time {
+        mgr.set_time_rules_enabled(false);
+    }
+    Ok(mgr)
+}
 
-    rt.block_on(async move {
-        let mut mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
-        if disable_logs {
-            mgr.set_logging_enabled(false);
-        }
-        if disable_ids {
-            mgr.set_ids_enabled(false);
-        }
-        if disable_ips {
-            mgr.set_ips_enabled(false);
-        }
-        if disable_geo {
-            mgr.set_geo_rules_enabled(false);
-        }
-        if disable_time {
-            mgr.set_time_rules_enabled(false);
-        }
-        let capture_payload = capture_payload_enabled(&mgr);
+fn summarize_manager(mgr: &FirewallManager) -> WorkerSummary {
+    WorkerSummary {
+        counters: mgr.counters(),
+        flow_stats: mgr.flow_stats(),
+        flows: mgr.flows(),
+        alerts: mgr.alerts(None),
+        suspicious: mgr.suspicious_flows(),
+        rule_hits: mgr.rule_hits(),
+        proto_counters: mgr.protocol_counters(),
+    }
+}
 
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-        let iface_clone = iface.clone();
-        let dp_cfg_reader = dp_cfg.clone();
-        let reader = tokio::task::spawn_blocking(move || -> Result<(), String> {
+fn merge_worker_summaries(results: Vec<WorkerSummary>, processed: usize) -> CaptureSummary {
+    let mut summary = CaptureSummary {
+        processed,
+        counters: FirewallCounters::default(),
+        flow_stats: FlowStats::default(),
+        flows: Vec::new(),
+        alerts: Vec::new(),
+        suspicious: Vec::new(),
+        rule_hits: HashMap::new(),
+        proto_counters: HashMap::new(),
+    };
+    for result in results {
+        summary.counters.allowed += result.counters.allowed;
+        summary.counters.dropped += result.counters.dropped;
+        summary.flow_stats.packets += result.flow_stats.packets;
+        summary.flow_stats.new_flows += result.flow_stats.new_flows;
+        summary.flow_stats.evicted += result.flow_stats.evicted;
+        summary.flows.extend(result.flows);
+        summary.alerts.extend(result.alerts);
+        summary.suspicious.extend(result.suspicious);
+        for (rule, hits) in result.rule_hits {
+            *summary.rule_hits.entry(rule).or_insert(0) += hits;
+        }
+        for (proto, hits) in result.proto_counters {
+            *summary.proto_counters.entry(proto).or_insert(0) += hits;
+        }
+    }
+    summary
+}
+
+fn resolve_shard_plan(dp_cfg: &DataplaneConfig) -> Result<ShardPlan, String> {
+    let rss = match dp_cfg.rss.as_ref() {
+        Some(rss) if rss.enabled => rss,
+        _ => return Ok(ShardPlan::Single),
+    };
+    let affinity = rss.cpu_affinity.as_ref();
+    match dp_cfg.backend {
+        BackendKind::Pcap => {
+            let workers = if let Some(cores) = affinity {
+                if cores.is_empty() {
+                    return Err("cpu_affinity cannot be empty".into());
+                }
+                cores.len()
+            } else {
+                rss.queues
+                    .as_ref()
+                    .map(|q| q.len())
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1)
+                    })
+            };
+            if workers > 1 {
+                Ok(ShardPlan::Software { workers })
+            } else {
+                Ok(ShardPlan::Single)
+            }
+        }
+        BackendKind::AfXdp => {
+            let af_cfg = dp_cfg.af_xdp.clone().unwrap_or_default();
+            let queues = rss.queues.clone().unwrap_or_else(|| {
+                vec![af_cfg.queue.unwrap_or(0) as u16]
+            });
+            let queues = normalize_queue_list(queues, u16::MAX)?;
+            if let Some(cores) = affinity {
+                if cores.len() != queues.len() {
+                    return Err("cpu_affinity length must match queue count".into());
+                }
+            }
+            if queues.len() > 1 {
+                Ok(ShardPlan::PerQueue { queues })
+            } else {
+                Ok(ShardPlan::Single)
+            }
+        }
+        BackendKind::Dpdk => {
+            let dpdk_cfg = dp_cfg.dpdk.clone().unwrap_or_default();
+            if dpdk_cfg.rx_queues == 0 {
+                return Err("dpdk rx_queues must be > 0".into());
+            }
+            let queues = rss
+                .queues
+                .clone()
+                .unwrap_or_else(|| (0..dpdk_cfg.rx_queues).collect());
+            let queues = normalize_queue_list(queues, dpdk_cfg.rx_queues)?;
+            if let Some(cores) = affinity {
+                if cores.len() != queues.len() {
+                    return Err("cpu_affinity length must match queue count".into());
+                }
+            }
+            if queues.len() > 1 {
+                Ok(ShardPlan::PerQueue { queues })
+            } else {
+                Ok(ShardPlan::Single)
+            }
+        }
+    }
+}
+
+fn normalize_queue_list(mut queues: Vec<u16>, max: u16) -> Result<Vec<u16>, String> {
+    if queues.is_empty() {
+        return Err("rss queue list is empty".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for q in &queues {
+        if *q >= max {
+            return Err(format!("rss queue {q} out of range"));
+        }
+        if !seen.insert(*q) {
+            return Err("rss queue list contains duplicates".into());
+        }
+    }
+    queues.shrink_to_fit();
+    Ok(queues)
+}
+
+fn resolve_worker_core(
+    rss: Option<&RssConfig>,
+    worker_index: usize,
+    worker_count: usize,
+) -> Result<Option<usize>, String> {
+    let cores = match rss.and_then(|r| r.cpu_affinity.as_ref()) {
+        Some(cores) => cores,
+        None => return Ok(None),
+    };
+    if cores.len() != worker_count {
+        return Err("cpu_affinity length must match worker count".into());
+    }
+    cores
+        .get(worker_index)
+        .copied()
+        .ok_or_else(|| "cpu_affinity index missing".to_string())
+        .map(Some)
+}
+
+fn pin_current_thread(core_id: usize) -> Result<(), String> {
+    let cores = core_affinity::get_core_ids().ok_or("cpu affinity unsupported")?;
+    let target = cores
+        .into_iter()
+        .find(|core| core.id == core_id)
+        .ok_or_else(|| format!("cpu core {core_id} not available"))?;
+    if core_affinity::set_for_current(target) {
+        Ok(())
+    } else {
+        Err(format!("failed to pin to cpu core {core_id}"))
+    }
+}
+
+fn dataplane_config_for_queue(cfg: &DataplaneConfig, queue: u16) -> DataplaneConfig {
+    let mut cfg = cfg.clone();
+    match cfg.backend {
+        BackendKind::Dpdk => {
+            let mut dpdk = cfg.dpdk.clone().unwrap_or_default();
+            dpdk.rx_queue = Some(queue);
+            dpdk.tx_queue = Some(queue);
+            cfg.dpdk = Some(dpdk);
+        }
+        BackendKind::AfXdp => {
+            let mut af_xdp = cfg.af_xdp.clone().unwrap_or_default();
+            af_xdp.queue = Some(queue as u32);
+            cfg.af_xdp = Some(af_xdp);
+        }
+        BackendKind::Pcap => {}
+    }
+    cfg
+}
+
+fn run_capture_pipeline(
+    iface: &str,
+    rules_path: &std::path::Path,
+    policies_path: Option<&std::path::Path>,
+    tuning: &Tuning,
+    dp_cfg: DataplaneConfig,
+    count: usize,
+    audit_log: Option<&str>,
+    disable_logs: bool,
+    disable_ids: bool,
+    disable_ips: bool,
+    disable_geo: bool,
+    disable_time: bool,
+) -> Result<CaptureSummary, String> {
+    match resolve_shard_plan(&dp_cfg)? {
+        ShardPlan::Single => run_capture_single(
+            iface,
+            rules_path,
+            policies_path,
+            tuning,
+            &dp_cfg,
+            count,
+            audit_log,
+            disable_logs,
+            disable_ids,
+            disable_ips,
+            disable_geo,
+            disable_time,
+        ),
+        ShardPlan::PerQueue { queues } => run_capture_per_queue(
+            iface,
+            rules_path,
+            policies_path,
+            tuning,
+            &dp_cfg,
+            queues,
+            count,
+            audit_log,
+            disable_logs,
+            disable_ids,
+            disable_ips,
+            disable_geo,
+            disable_time,
+        ),
+        ShardPlan::Software { workers } => run_capture_software_sharded(
+            iface,
+            rules_path,
+            policies_path,
+            tuning,
+            &dp_cfg,
+            workers,
+            count,
+            audit_log,
+            disable_logs,
+            disable_ids,
+            disable_ips,
+            disable_geo,
+            disable_time,
+        ),
+    }
+}
+
+fn run_capture_single(
+    iface: &str,
+    rules_path: &std::path::Path,
+    policies_path: Option<&std::path::Path>,
+    tuning: &Tuning,
+    dp_cfg: &DataplaneConfig,
+    count: usize,
+    audit_log: Option<&str>,
+    disable_logs: bool,
+    disable_ids: bool,
+    disable_ips: bool,
+    disable_geo: bool,
+    disable_time: bool,
+) -> Result<CaptureSummary, String> {
+    let mut mgr = build_manager(
+        rules_path,
+        policies_path,
+        tuning,
+        disable_logs,
+        disable_ids,
+        disable_ips,
+        disable_geo,
+        disable_time,
+    )?;
+    let capture_payload = capture_payload_enabled(&mgr);
+    let mut dataplane =
+        DataplaneHandle::open_live(iface, dp_cfg).map_err(|e| format!("dataplane: {e}"))?;
+    if let Some(rss) = dp_cfg.rss.as_ref() {
+        if rss.enabled && dp_cfg.backend != BackendKind::Pcap {
+            dataplane
+                .configure_rss(rss)
+                .map_err(|e| format!("dataplane rss: {e}"))?;
+        }
+    }
+
+    let mut processed = 0usize;
+    while processed < count {
+        match dataplane.next_frame() {
+            Ok(Some(pkt)) => {
+                let frame = FrameRef::from_view(&pkt);
+                if let Ok(meta) =
+                    packet_metadata(frame.bytes(), Direction::Ingress, capture_payload)
+                {
+                    let eval = mgr.evaluate(&meta, Some(iface), Instant::now());
+                    if let Some(path) = &audit_log {
+                        let _ = write_audit(path, &meta, &eval);
+                    }
+                    processed += 1;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => return Err(format!("dataplane read: {e}")),
+        }
+    }
+    let summary = summarize_manager(&mgr);
+    Ok(merge_worker_summaries(vec![summary], processed))
+}
+
+fn run_capture_per_queue(
+    iface: &str,
+    rules_path: &std::path::Path,
+    policies_path: Option<&std::path::Path>,
+    tuning: &Tuning,
+    dp_cfg: &DataplaneConfig,
+    queues: Vec<u16>,
+    count: usize,
+    audit_log: Option<&str>,
+    disable_logs: bool,
+    disable_ids: bool,
+    disable_ips: bool,
+    disable_geo: bool,
+    disable_time: bool,
+) -> Result<CaptureSummary, String> {
+    let rss = dp_cfg.rss.as_ref();
+    let processed = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(queues.len());
+    let rules_path = rules_path.to_path_buf();
+    let policies_path = policies_path.map(|p| p.to_path_buf());
+    let audit_log = audit_log.map(|s| s.to_string());
+    let tuning = tuning.clone();
+
+    let worker_count = queues.len();
+    for (worker_index, queue) in queues.into_iter().enumerate() {
+        let core_id = resolve_worker_core(rss, worker_index, worker_count)?;
+        let iface = iface.to_string();
+        let rules_path = rules_path.clone();
+        let policies_path = policies_path.clone();
+        let audit_log = audit_log.clone();
+        let tuning = tuning.clone();
+        let dp_cfg = dataplane_config_for_queue(dp_cfg, queue);
+        let processed = Arc::clone(&processed);
+        let stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || -> Result<WorkerSummary, String> {
+            if let Some(core_id) = core_id {
+                pin_current_thread(core_id)?;
+            }
+            let mut mgr = build_manager(
+                &rules_path,
+                policies_path.as_deref(),
+                &tuning,
+                disable_logs,
+                disable_ids,
+                disable_ips,
+                disable_geo,
+                disable_time,
+            )?;
+            let capture_payload = capture_payload_enabled(&mgr);
             let mut dataplane =
-                DataplaneHandle::open_live(&iface_clone, &dp_cfg_reader)
-                    .map_err(|e| format!("dataplane: {e}"))?;
-            if let Some(rss) = dp_cfg_reader.rss.as_ref() {
+                DataplaneHandle::open_live(&iface, &dp_cfg).map_err(|e| format!("dataplane: {e}"))?;
+            if let Some(rss) = dp_cfg.rss.as_ref() {
                 if rss.enabled {
+                    let caps = dataplane.capabilities();
+                    if !caps.supports_rss {
+                        stop.store(true, Ordering::Release);
+                        return Err("dataplane does not support rss".into());
+                    }
                     dataplane
                         .configure_rss(rss)
-                        .map_err(|e| format!("dataplane rss: {e}"))?;
+                        .map_err(|e| {
+                            stop.store(true, Ordering::Release);
+                            format!("dataplane rss: {e}")
+                        })?;
                 }
             }
-            let mut processed = 0usize;
-            while processed < count {
+
+            while !stop.load(Ordering::Relaxed) {
                 match dataplane.next_frame() {
                     Ok(Some(pkt)) => {
-                        if tx.blocking_send(pkt.bytes().to_vec()).is_err() {
+                        let idx = processed.fetch_add(1, Ordering::AcqRel);
+                        if idx >= count {
+                            stop.store(true, Ordering::Release);
                             break;
                         }
-                        processed += 1;
+                        let frame = FrameRef::from_view(&pkt);
+                        if let Ok(meta) =
+                            packet_metadata(frame.bytes(), Direction::Ingress, capture_payload)
+                        {
+                            let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
+                            if let Some(path) = &audit_log {
+                                let _ = write_audit(path, &meta, &eval);
+                            }
+                        }
                     }
                     Ok(None) => continue,
-                    Err(e) => return Err(format!("dataplane read: {e}")),
+                    Err(e) => {
+                        stop.store(true, Ordering::Release);
+                        return Err(format!("dataplane read: {e}"));
+                    }
                 }
             }
-            Ok(())
+            Ok(summarize_manager(&mgr))
         });
+        handles.push(handle);
+    }
 
-        while let Some(data) = rx.recv().await {
-            if let Ok(meta) = packet_metadata(&data, Direction::Ingress, capture_payload) {
-                let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
-                if let Some(path) = &audit_log {
-                    let _ = write_audit(path, &meta, &eval);
+    let mut results = Vec::with_capacity(handles.len());
+    let mut error: Option<String> = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(summary)) => results.push(summary),
+            Ok(Err(err)) => {
+                if error.is_none() {
+                    error = Some(err);
+                }
+            }
+            Err(_) => {
+                if error.is_none() {
+                    error = Some("worker join failed".into());
                 }
             }
         }
-        reader.await.map_err(|e| format!("reader join: {e}"))??;
-        println!(
-            "Async capture finished: allowed={} dropped={} flows={}",
-            mgr.counters().allowed,
-            mgr.counters().dropped,
-            mgr.flows().len()
-        );
-        Ok::<(), String>(())
-    })
+    }
+    let processed = processed.load(Ordering::Acquire).min(count);
+    if let Some(err) = error {
+        return Err(err);
+    }
+    Ok(merge_worker_summaries(results, processed))
+}
+
+fn run_capture_software_sharded(
+    iface: &str,
+    rules_path: &std::path::Path,
+    policies_path: Option<&std::path::Path>,
+    tuning: &Tuning,
+    dp_cfg: &DataplaneConfig,
+    workers: usize,
+    count: usize,
+    audit_log: Option<&str>,
+    disable_logs: bool,
+    disable_ids: bool,
+    disable_ips: bool,
+    disable_geo: bool,
+    disable_time: bool,
+) -> Result<CaptureSummary, String> {
+    let rss = dp_cfg
+        .rss
+        .as_ref()
+        .ok_or("rss config missing for software sharding")?;
+    let sharder = FlowSharder::new(rss, workers);
+    let mut senders = Vec::with_capacity(workers);
+    let mut handles = Vec::with_capacity(workers);
+    let rules_path = rules_path.to_path_buf();
+    let policies_path = policies_path.map(|p| p.to_path_buf());
+    let audit_log = audit_log.map(|s| s.to_string());
+    let tuning = tuning.clone();
+
+    for worker_index in 0..workers {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+        senders.push(tx);
+        let core_id = resolve_worker_core(Some(rss), worker_index, workers)?;
+        let rules_path = rules_path.clone();
+        let policies_path = policies_path.clone();
+        let audit_log = audit_log.clone();
+        let tuning = tuning.clone();
+        let iface = iface.to_string();
+        let handle = thread::spawn(move || -> Result<WorkerSummary, String> {
+            if let Some(core_id) = core_id {
+                pin_current_thread(core_id)?;
+            }
+            let mut mgr = build_manager(
+                &rules_path,
+                policies_path.as_deref(),
+                &tuning,
+                disable_logs,
+                disable_ids,
+                disable_ips,
+                disable_geo,
+                disable_time,
+            )?;
+            let capture_payload = capture_payload_enabled(&mgr);
+            for data in rx {
+                if let Ok(meta) = packet_metadata(&data, Direction::Ingress, capture_payload) {
+                    let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
+                    if let Some(path) = &audit_log {
+                        let _ = write_audit(path, &meta, &eval);
+                    }
+                }
+            }
+            Ok(summarize_manager(&mgr))
+        });
+        handles.push(handle);
+    }
+
+    let mut dataplane =
+        DataplaneHandle::open_live(iface, dp_cfg).map_err(|e| format!("dataplane: {e}"))?;
+    let mut processed = 0usize;
+    let mut error: Option<String> = None;
+    while processed < count {
+        match dataplane.next_frame() {
+            Ok(Some(pkt)) => {
+                let bytes = pkt.bytes().to_vec();
+                let idx = sharder.select_queue(&bytes);
+                if senders[idx].send(bytes).is_err() {
+                    error = Some("worker channel closed".into());
+                    break;
+                }
+                processed += 1;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                error = Some(format!("dataplane read: {e}"));
+                break;
+            }
+        }
+    }
+    drop(senders);
+
+    let mut results = Vec::with_capacity(handles.len());
+    let mut join_error: Option<String> = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(summary)) => results.push(summary),
+            Ok(Err(err)) => {
+                if join_error.is_none() {
+                    join_error = Some(err);
+                }
+            }
+            Err(_) => {
+                if join_error.is_none() {
+                    join_error = Some("worker join failed".into());
+                }
+            }
+        }
+    }
+    if let Some(err) = join_error {
+        return Err(err);
+    }
+    if let Some(err) = error {
+        return Err(err);
+    }
+    Ok(merge_worker_summaries(results, processed))
 }
 
 fn cmd_replay(args: Vec<String>) -> Result<(), String> {
@@ -1622,5 +2144,45 @@ mod tests {
     fn policy_parser_rejects_bad_time() {
         assert!(parse_policy_line("priority 1 action allow time 25-30").is_err());
         assert!(parse_policy_line("priority 1 action allow time 9-nope").is_err());
+    }
+
+    #[test]
+    fn rss_cpu_affinity_sets_worker_count_for_pcap() {
+        let mut cfg = DataplaneConfig::default();
+        cfg.backend = BackendKind::Pcap;
+        cfg.rss = Some(RssConfig {
+            enabled: true,
+            symmetric: false,
+            hash_fields: vec![dataplane::RssHashField::Ipv4],
+            seed: None,
+            queues: None,
+            cpu_affinity: Some(vec![0, 1]),
+        });
+        let plan = resolve_shard_plan(&cfg).unwrap();
+        match plan {
+            ShardPlan::Software { workers } => assert_eq!(workers, 2),
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rss_cpu_affinity_mismatch_errors() {
+        let mut cfg = DataplaneConfig::default();
+        cfg.backend = BackendKind::Dpdk;
+        cfg.dpdk = Some(dataplane::DpdkConfig {
+            rx_queues: 2,
+            tx_queues: 2,
+            ..dataplane::DpdkConfig::default()
+        });
+        cfg.rss = Some(RssConfig {
+            enabled: true,
+            symmetric: false,
+            hash_fields: vec![dataplane::RssHashField::Ipv4],
+            seed: None,
+            queues: Some(vec![0, 1]),
+            cpu_affinity: Some(vec![0]),
+        });
+        let err = resolve_shard_plan(&cfg).unwrap_err();
+        assert!(err.contains("cpu_affinity length"));
     }
 }

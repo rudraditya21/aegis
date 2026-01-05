@@ -3,6 +3,8 @@
 #[derive(Debug, Clone)]
 pub struct DpdkConfig {
     pub port_id: Option<u16>,
+    pub rx_queue: Option<u16>,
+    pub tx_queue: Option<u16>,
     pub rx_queues: u16,
     pub tx_queues: u16,
     pub mbuf_count: usize,
@@ -58,6 +60,8 @@ impl Default for DpdkConfig {
     fn default() -> Self {
         DpdkConfig {
             port_id: None,
+            rx_queue: None,
+            tx_queue: None,
             rx_queues: 1,
             tx_queues: 1,
             mbuf_count: 8192,
@@ -246,6 +250,27 @@ mod linux {
         rss_offload: u64,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PortConfig {
+        port_id: u16,
+        rx_queues: u16,
+        tx_queues: u16,
+        rx_desc: u16,
+        tx_desc: u16,
+        promisc: bool,
+        socket_id: c_int,
+        mbuf_count: usize,
+        mbuf_cache: usize,
+    }
+
+    #[derive(Debug)]
+    struct PortState {
+        config: PortConfig,
+        mempools: Vec<*mut rte_mempool>,
+    }
+
+    static PORT_STATE: OnceLock<PortState> = OnceLock::new();
+
     extern "C" {
         fn rte_eal_init(argc: c_int, argv: *mut *mut c_char) -> c_int;
         fn rte_socket_id() -> c_int;
@@ -393,55 +418,29 @@ mod linux {
                 return Err(DpdkError::Config("port_id out of range".into()));
             }
 
-            let socket_id = cfg.socket_id.unwrap_or_else(|| unsafe { rte_socket_id() });
-            let mbuf_pool = create_mempool(cfg, socket_id)?;
-
-            let rc = unsafe { aegis_dpdk_port_configure(port_id, cfg.rx_queues, cfg.tx_queues) };
-            if rc < 0 {
-                return Err(dpdk_err("port configure"));
+            let port_state = init_port(cfg, port_id)?;
+            let rx_queue = cfg.rx_queue.unwrap_or(0);
+            let tx_queue = cfg.tx_queue.unwrap_or(rx_queue);
+            if rx_queue >= port_state.config.rx_queues {
+                return Err(DpdkError::Config("rx_queue out of range".into()));
             }
-
-            for q in 0..cfg.rx_queues {
-                let rc = unsafe {
-                    aegis_dpdk_rx_queue_setup(
-                        port_id,
-                        q,
-                        cfg.rx_desc,
-                        socket_id,
-                        mbuf_pool,
-                    )
-                };
-                if rc < 0 {
-                    return Err(dpdk_err("rx queue setup"));
-                }
+            if tx_queue >= port_state.config.tx_queues {
+                return Err(DpdkError::Config("tx_queue out of range".into()));
             }
-
-            for q in 0..cfg.tx_queues {
-                let rc = unsafe {
-                    aegis_dpdk_tx_queue_setup(port_id, q, cfg.tx_desc, socket_id)
-                };
-                if rc < 0 {
-                    return Err(dpdk_err("tx queue setup"));
-                }
-            }
-
-            let rc = unsafe { rte_eth_dev_start(port_id) };
-            if rc < 0 {
-                return Err(dpdk_err("dev start"));
-            }
-            if cfg.promisc {
-                unsafe { rte_eth_promiscuous_enable(port_id) };
-            }
+            let mbuf_pool = *port_state
+                .mempools
+                .get(rx_queue as usize)
+                .ok_or_else(|| DpdkError::Config("mempool missing for rx_queue".into()))?;
 
             let rx_burst = cfg.rx_burst.max(1);
             let tx_burst = cfg.tx_burst.max(1);
 
             Ok(DpdkDataplane {
                 port_id,
-                rx_queue: 0,
-                tx_queue: 0,
-                rx_queues: cfg.rx_queues,
-                tx_queues: cfg.tx_queues,
+                rx_queue,
+                tx_queue,
+                rx_queues: port_state.config.rx_queues,
+                tx_queues: port_state.config.tx_queues,
                 mempool: mbuf_pool,
                 rx_cache: Vec::with_capacity(rx_burst as usize),
                 rx_buf: vec![ptr::null_mut(); rx_burst as usize],
@@ -649,6 +648,70 @@ mod linux {
         Ok(())
     }
 
+    fn init_port(cfg: &DpdkConfig, port_id: u16) -> Result<&'static PortState, DpdkError> {
+        let desired = desired_port_config(cfg, port_id)?;
+        if let Some(state) = PORT_STATE.get() {
+            if state.config != desired {
+                return Err(DpdkError::Config(
+                    "dpdk port already initialized with different config".into(),
+                ));
+            }
+            return Ok(state);
+        }
+
+        let config = desired;
+        let mut mempools = Vec::with_capacity(config.rx_queues as usize);
+        for q in 0..config.rx_queues {
+            let pool = create_mempool(cfg, config.socket_id, port_id, q)?;
+            mempools.push(pool);
+        }
+
+        let rc = unsafe { aegis_dpdk_port_configure(port_id, config.rx_queues, config.tx_queues) };
+        if rc < 0 {
+            return Err(dpdk_err("port configure"));
+        }
+
+        for q in 0..config.rx_queues {
+            let pool = mempools[q as usize];
+            let rc = unsafe {
+                aegis_dpdk_rx_queue_setup(port_id, q, config.rx_desc, config.socket_id, pool)
+            };
+            if rc < 0 {
+                return Err(dpdk_err("rx queue setup"));
+            }
+        }
+
+        for q in 0..config.tx_queues {
+            let rc = unsafe {
+                aegis_dpdk_tx_queue_setup(port_id, q, config.tx_desc, config.socket_id)
+            };
+            if rc < 0 {
+                return Err(dpdk_err("tx queue setup"));
+            }
+        }
+
+        let rc = unsafe { rte_eth_dev_start(port_id) };
+        if rc < 0 {
+            return Err(dpdk_err("dev start"));
+        }
+        if config.promisc {
+            unsafe { rte_eth_promiscuous_enable(port_id) };
+        }
+
+        let state = PortState { config, mempools };
+        if PORT_STATE.set(state).is_err() {
+            let state = PORT_STATE.get().ok_or_else(|| {
+                DpdkError::Backend("dpdk port initialization race".into())
+            })?;
+            if state.config != desired {
+                return Err(DpdkError::Config(
+                    "dpdk port already initialized with different config".into(),
+                ));
+            }
+        }
+        PORT_STATE.get().ok_or_else(|| DpdkError::Backend("dpdk port init failed".into()))
+    }
+
     fn build_eal_args(cfg: &DpdkConfig) -> Vec<String> {
         let mut args = vec!["aegis-dpdk".to_string()];
         if let Some(mask) = &cfg.core_mask {
@@ -676,8 +739,14 @@ mod linux {
         args
     }
 
-    fn create_mempool(cfg: &DpdkConfig, socket_id: c_int) -> Result<*mut rte_mempool, DpdkError> {
-        let name = CString::new("aegis_mbuf_pool").unwrap();
+    fn create_mempool(
+        cfg: &DpdkConfig,
+        socket_id: c_int,
+        port_id: u16,
+        queue_id: u16,
+    ) -> Result<*mut rte_mempool, DpdkError> {
+        let name = format!("aegis_mbuf_pool_{port_id}_{queue_id}");
+        let name = CString::new(name).map_err(|_| DpdkError::Config("invalid mempool name".into()))?;
         let data_room = 2048u16 + 128u16;
         let pool = unsafe {
             rte_pktmbuf_pool_create(
@@ -693,6 +762,21 @@ mod linux {
             return Err(dpdk_err("mbuf pool create"));
         }
         Ok(pool)
+    }
+
+    fn desired_port_config(cfg: &DpdkConfig, port_id: u16) -> Result<PortConfig, DpdkError> {
+        let socket_id = cfg.socket_id.unwrap_or_else(|| unsafe { rte_socket_id() });
+        Ok(PortConfig {
+            port_id,
+            rx_queues: cfg.rx_queues,
+            tx_queues: cfg.tx_queues,
+            rx_desc: cfg.rx_desc,
+            tx_desc: cfg.tx_desc,
+            promisc: cfg.promisc,
+            socket_id,
+            mbuf_count: cfg.mbuf_count,
+            mbuf_cache: cfg.mbuf_cache,
+        })
     }
 
     fn allocate_mbuf(pool: *mut rte_mempool, len: usize) -> Result<*mut rte_mbuf, DpdkError> {
@@ -732,6 +816,8 @@ mod tests {
     #[test]
     fn dpdk_config_defaults_are_sane() {
         let cfg = DpdkConfig::default();
+        assert!(cfg.rx_queue.is_none());
+        assert!(cfg.tx_queue.is_none());
         assert_eq!(cfg.rx_queues, 1);
         assert_eq!(cfg.tx_queues, 1);
         assert_eq!(cfg.mem_channels, 4);
