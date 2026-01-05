@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-af-xdp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "aegis-config"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +46,7 @@ dependencies = [
 name = "aegis-dataplane"
 version = "0.1.0"
 dependencies = [
+ "aegis-af-xdp",
  "pcap-shim",
  "serde",
 ]

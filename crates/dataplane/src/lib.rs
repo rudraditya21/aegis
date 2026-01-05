@@ -12,6 +12,12 @@ mod pcap;
 #[cfg(feature = "pcap")]
 pub use pcap::{PcapDataplane, PcapFrame};
 
+#[cfg(all(feature = "af-xdp", target_os = "linux"))]
+mod af_xdp;
+
+#[cfg(all(feature = "af-xdp", target_os = "linux"))]
+pub use af_xdp::AfXdpDataplane;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
@@ -86,6 +92,15 @@ pub struct AfXdpConfig {
     pub frame_size: usize,
     pub headroom: usize,
     pub use_need_wakeup: bool,
+    pub xdp_program_pin: Option<String>,
+    pub xsk_map_pin: Option<String>,
+    pub pin_dir: Option<String>,
+    pub program_name: Option<String>,
+    pub map_name: Option<String>,
+    pub xsk_map_entries: Option<u32>,
+    pub attach: bool,
+    pub mode: AfXdpMode,
+    pub update_if_noexist: bool,
 }
 
 impl Default for AfXdpConfig {
@@ -96,8 +111,26 @@ impl Default for AfXdpConfig {
             frame_size: 2048,
             headroom: 256,
             use_need_wakeup: false,
+            xdp_program_pin: None,
+            xsk_map_pin: None,
+            pin_dir: None,
+            program_name: None,
+            map_name: None,
+            xsk_map_entries: None,
+            attach: false,
+            mode: AfXdpMode::Auto,
+            update_if_noexist: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum AfXdpMode {
+    Auto,
+    Skb,
+    Drv,
 }
 
 #[derive(Debug, Clone)]
@@ -222,12 +255,16 @@ pub trait Dataplane {
 pub enum DataplaneHandle {
     #[cfg(feature = "pcap")]
     Pcap(PcapDataplane),
+    #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+    AfXdp(AfXdpDataplane),
 }
 
 #[derive(Debug)]
 pub enum AnyFrame<'a> {
     #[cfg(feature = "pcap")]
     Pcap(PcapFrame<'a>),
+    #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+    AfXdp(af_xdp::AfXdpFrame<'a>),
 }
 
 impl FrameView for AnyFrame<'_> {
@@ -235,6 +272,8 @@ impl FrameView for AnyFrame<'_> {
         match self {
             #[cfg(feature = "pcap")]
             AnyFrame::Pcap(frame) => frame.bytes(),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            AnyFrame::AfXdp(frame) => frame.bytes(),
         }
     }
 
@@ -242,6 +281,8 @@ impl FrameView for AnyFrame<'_> {
         match self {
             #[cfg(feature = "pcap")]
             AnyFrame::Pcap(frame) => frame.timestamp(),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            AnyFrame::AfXdp(frame) => frame.timestamp(),
         }
     }
 }
@@ -267,13 +308,84 @@ impl DataplaneHandle {
                     ))
                 }
             }
-            BackendKind::AfXdp => Err(DataplaneError::Unsupported(
-                if cfg!(target_os = "linux") {
-                    "af-xdp backend not built (enable feature af-xdp)"
-                } else {
-                    "af-xdp backend only supported on linux"
-                },
-            )),
+            BackendKind::AfXdp => {
+                #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+                {
+                    let af_cfg = cfg.af_xdp.clone().unwrap_or_default();
+                    let mut program_pin = af_cfg.xdp_program_pin.clone();
+                    let mut map_pin = af_cfg.xsk_map_pin.clone();
+                    if af_cfg.attach && program_pin.is_none() {
+                        let pin_dir = af_cfg
+                            .pin_dir
+                            .clone()
+                            .unwrap_or_else(|| "/sys/fs/bpf/aegis".to_string());
+                        let program_name = af_cfg
+                            .program_name
+                            .clone()
+                            .unwrap_or_else(|| format!("xdp_prog_{iface}"));
+                        let map_name = af_cfg
+                            .map_name
+                            .clone()
+                            .unwrap_or_else(|| format!("xsk_map_{iface}"));
+                        let entries = af_cfg
+                            .xsk_map_entries
+                            .unwrap_or_else(|| af_cfg.queue.unwrap_or(0) + 1)
+                            .max(1);
+                        let pinned = aegis_af_xdp::ensure_pinned_xdp_program(
+                            std::path::Path::new(&pin_dir),
+                            &program_name,
+                            &map_name,
+                            entries,
+                        )
+                        .map_err(|e| DataplaneError::Backend(format!("af-xdp pin: {e}")))?;
+                        program_pin = Some(pinned.program_pin.to_string_lossy().to_string());
+                        map_pin = Some(pinned.map_pin.to_string_lossy().to_string());
+                    }
+                    let inner_cfg = aegis_af_xdp::AfXdpConfig {
+                        queue: af_cfg.queue,
+                        umem_frames: af_cfg.umem_frames,
+                        frame_size: af_cfg.frame_size,
+                        headroom: af_cfg.headroom,
+                        use_need_wakeup: af_cfg.use_need_wakeup,
+                    };
+                    let mut dp = AfXdpDataplane::open_live(iface, &inner_cfg).map_err(|e| {
+                        DataplaneError::Backend(format!("af-xdp init: {e}"))
+                    })?;
+                    if let Some(map_pin) = map_pin.as_deref() {
+                        dp.update_xsk_map(map_pin)
+                            .map_err(|e| DataplaneError::Backend(format!("af-xdp map: {e}")))?;
+                    }
+                    if af_cfg.attach {
+                        let prog_pin = program_pin.as_deref().ok_or_else(|| {
+                            DataplaneError::Config(
+                                "xdp_program_pin or pin_dir required when attach=true".into(),
+                            )
+                        })?;
+                        let flags = crate::af_xdp::XdpAttachFlags {
+                            mode: match af_cfg.mode {
+                                AfXdpMode::Auto => crate::af_xdp::XdpAttachMode::Auto,
+                                AfXdpMode::Skb => crate::af_xdp::XdpAttachMode::Skb,
+                                AfXdpMode::Drv => crate::af_xdp::XdpAttachMode::Drv,
+                            },
+                            update_if_noexist: af_cfg.update_if_noexist,
+                        };
+                        dp.attach_xdp_program(prog_pin, flags)
+                            .map_err(|e| DataplaneError::Backend(format!("af-xdp attach: {e}")))?;
+                    }
+                    return Ok(DataplaneHandle::AfXdp(dp));
+                }
+                #[cfg(not(all(feature = "af-xdp", target_os = "linux")))]
+                {
+                    let _ = iface;
+                    Err(DataplaneError::Unsupported(
+                        if cfg!(target_os = "linux") {
+                            "af-xdp backend not built (enable feature af-xdp)"
+                        } else {
+                            "af-xdp backend only supported on linux"
+                        },
+                    ))
+                }
+            }
             BackendKind::Dpdk => Err(DataplaneError::Unsupported(
                 if cfg!(target_os = "linux") {
                     "dpdk backend not built (enable feature dpdk)"
@@ -294,6 +406,10 @@ impl Dataplane for DataplaneHandle {
             DataplaneHandle::Pcap(dp) => dp
                 .next_frame()
                 .map(|opt| opt.map(AnyFrame::Pcap)),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            DataplaneHandle::AfXdp(dp) => dp
+                .next_frame()
+                .map(|opt| opt.map(AnyFrame::AfXdp)),
         }
     }
 
@@ -303,6 +419,11 @@ impl Dataplane for DataplaneHandle {
             DataplaneHandle::Pcap(dp) => match frame {
                 AnyFrame::Pcap(frame) => dp.send_frame(frame),
             },
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            DataplaneHandle::AfXdp(dp) => match frame {
+                AnyFrame::AfXdp(frame) => dp.send_frame(frame),
+                _ => Err(DataplaneError::Unsupported("frame type mismatch")),
+            },
         }
     }
 
@@ -310,6 +431,8 @@ impl Dataplane for DataplaneHandle {
         match self {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => dp.stats(),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            DataplaneHandle::AfXdp(dp) => dp.stats(),
         }
     }
 
@@ -317,6 +440,8 @@ impl Dataplane for DataplaneHandle {
         match self {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => dp.configure_rss(rss),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            DataplaneHandle::AfXdp(dp) => dp.configure_rss(rss),
         }
     }
 
@@ -324,6 +449,8 @@ impl Dataplane for DataplaneHandle {
         match self {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => dp.capabilities(),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            DataplaneHandle::AfXdp(dp) => dp.capabilities(),
         }
     }
 }

@@ -5,6 +5,7 @@ members = [
     "crates/pcap-shim",
     "crates/utils",
     "crates/config",
+    "crates/af-xdp",
     "crates/dataplane",
     "aegis",
 ]

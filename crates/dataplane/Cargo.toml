@@ -6,10 +6,11 @@ edition = "2024"
 [features]
 default = ["pcap", "serde"]
 pcap = ["dep:pcap-shim"]
-af-xdp = []
+af-xdp = ["dep:aegis-af-xdp"]
 dpdk = []
 serde = ["dep:serde"]
 
 [dependencies]
 pcap-shim = { path = "../pcap-shim", optional = true }
+aegis-af-xdp = { path = "../af-xdp", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }

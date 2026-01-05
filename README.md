@@ -42,7 +42,28 @@ dataplane:
     enabled: false
 ```
 
-Supported backends: `pcap` (default). `af-xdp` and `dpdk` are parsed but require compiled backends.
+AF_XDP example (Linux only, feature-gated):
+```yaml
+dataplane:
+  backend: af-xdp
+  af-xdp:
+    queue: 0
+    umem-frames: 4096
+    frame-size: 2048
+    headroom: 256
+    use-need-wakeup: false
+    pin-dir: "/sys/fs/bpf/aegis"
+    program-name: "xdp_prog_eth0"
+    map-name: "xsk_map_eth0"
+    xsk-map-entries: 1
+    xsk-map-pin: "/sys/fs/bpf/aegis/xsk_map_eth0"
+    xdp-program-pin: "/sys/fs/bpf/aegis/xdp_prog_eth0"
+    attach: true
+    mode: auto
+    update-if-noexist: true
+```
+
+Supported backends: `pcap` (default). `af-xdp` and `dpdk` require compiled backends (feature flags) and Linux support.
 
 ### Rule File Format
 
