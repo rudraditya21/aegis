@@ -63,6 +63,27 @@ dataplane:
     update-if-noexist: true
 ```
 
+DPDK example (Linux only, feature-gated):
+```yaml
+dataplane:
+  backend: dpdk
+  dpdk:
+    port-id: 0
+    rx-queues: 1
+    tx-queues: 1
+    mbuf-count: 8192
+    mbuf-cache: 256
+    mem-channels: 4
+    no-huge: false
+    core-mask: "0"
+    rx-desc: 1024
+    tx-desc: 1024
+    rx-burst: 32
+    tx-burst: 32
+    promisc: true
+    eal-args: []
+```
+
 Supported backends: `pcap` (default). `af-xdp` and `dpdk` require compiled backends (feature flags) and Linux support.
 
 ### Rule File Format

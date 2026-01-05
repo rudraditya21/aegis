@@ -18,6 +18,12 @@ mod af_xdp;
 #[cfg(all(feature = "af-xdp", target_os = "linux"))]
 pub use af_xdp::AfXdpDataplane;
 
+#[cfg(all(feature = "dpdk", target_os = "linux"))]
+mod dpdk;
+
+#[cfg(all(feature = "dpdk", target_os = "linux"))]
+pub use dpdk::DpdkDataplane;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
@@ -144,6 +150,15 @@ pub struct DpdkConfig {
     pub mbuf_cache: usize,
     pub socket_id: Option<u16>,
     pub core_mask: Option<String>,
+    pub mem_channels: u32,
+    pub no_huge: bool,
+    pub file_prefix: Option<String>,
+    pub eal_args: Vec<String>,
+    pub rx_desc: u16,
+    pub tx_desc: u16,
+    pub rx_burst: u16,
+    pub tx_burst: u16,
+    pub promisc: bool,
 }
 
 impl Default for DpdkConfig {
@@ -156,6 +171,15 @@ impl Default for DpdkConfig {
             mbuf_cache: 256,
             socket_id: None,
             core_mask: None,
+            mem_channels: 4,
+            no_huge: false,
+            file_prefix: None,
+            eal_args: Vec::new(),
+            rx_desc: 1024,
+            tx_desc: 1024,
+            rx_burst: 32,
+            tx_burst: 32,
+            promisc: true,
         }
     }
 }
@@ -257,6 +281,8 @@ pub enum DataplaneHandle {
     Pcap(PcapDataplane),
     #[cfg(all(feature = "af-xdp", target_os = "linux"))]
     AfXdp(AfXdpDataplane),
+    #[cfg(all(feature = "dpdk", target_os = "linux"))]
+    Dpdk(DpdkDataplane),
 }
 
 #[derive(Debug)]
@@ -265,6 +291,8 @@ pub enum AnyFrame<'a> {
     Pcap(PcapFrame<'a>),
     #[cfg(all(feature = "af-xdp", target_os = "linux"))]
     AfXdp(af_xdp::AfXdpFrame<'a>),
+    #[cfg(all(feature = "dpdk", target_os = "linux"))]
+    Dpdk(dpdk::DpdkFrame<'a>),
 }
 
 impl FrameView for AnyFrame<'_> {
@@ -274,6 +302,8 @@ impl FrameView for AnyFrame<'_> {
             AnyFrame::Pcap(frame) => frame.bytes(),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             AnyFrame::AfXdp(frame) => frame.bytes(),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            AnyFrame::Dpdk(frame) => frame.bytes(),
         }
     }
 
@@ -283,6 +313,8 @@ impl FrameView for AnyFrame<'_> {
             AnyFrame::Pcap(frame) => frame.timestamp(),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             AnyFrame::AfXdp(frame) => frame.timestamp(),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            AnyFrame::Dpdk(frame) => frame.timestamp(),
         }
     }
 }
@@ -386,13 +418,44 @@ impl DataplaneHandle {
                     ))
                 }
             }
-            BackendKind::Dpdk => Err(DataplaneError::Unsupported(
-                if cfg!(target_os = "linux") {
-                    "dpdk backend not built (enable feature dpdk)"
-                } else {
-                    "dpdk backend only supported on linux"
-                },
-            )),
+            BackendKind::Dpdk => {
+                #[cfg(all(feature = "dpdk", target_os = "linux"))]
+                {
+                    let dpdk_cfg = cfg.dpdk.clone().unwrap_or_default();
+                    let inner_cfg = aegis_dpdk::DpdkConfig {
+                        port_id: dpdk_cfg.port_id,
+                        rx_queues: dpdk_cfg.rx_queues,
+                        tx_queues: dpdk_cfg.tx_queues,
+                        mbuf_count: dpdk_cfg.mbuf_count,
+                        mbuf_cache: dpdk_cfg.mbuf_cache,
+                        socket_id: dpdk_cfg.socket_id.map(|v| v as i32),
+                        core_mask: dpdk_cfg.core_mask.clone(),
+                        mem_channels: dpdk_cfg.mem_channels,
+                        no_huge: dpdk_cfg.no_huge,
+                        file_prefix: dpdk_cfg.file_prefix.clone(),
+                        eal_args: dpdk_cfg.eal_args.clone(),
+                        rx_desc: dpdk_cfg.rx_desc,
+                        tx_desc: dpdk_cfg.tx_desc,
+                        rx_burst: dpdk_cfg.rx_burst,
+                        tx_burst: dpdk_cfg.tx_burst,
+                        promisc: dpdk_cfg.promisc,
+                    };
+                    let dp = DpdkDataplane::open(iface, &inner_cfg)
+                        .map_err(|e| DataplaneError::Backend(format!("dpdk init: {e}")))?;
+                    return Ok(DataplaneHandle::Dpdk(dp));
+                }
+                #[cfg(not(all(feature = "dpdk", target_os = "linux")))]
+                {
+                    let _ = iface;
+                    Err(DataplaneError::Unsupported(
+                        if cfg!(target_os = "linux") {
+                            "dpdk backend not built (enable feature dpdk)"
+                        } else {
+                            "dpdk backend only supported on linux"
+                        },
+                    ))
+                }
+            }
         }
     }
 }
@@ -410,6 +473,10 @@ impl Dataplane for DataplaneHandle {
             DataplaneHandle::AfXdp(dp) => dp
                 .next_frame()
                 .map(|opt| opt.map(AnyFrame::AfXdp)),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            DataplaneHandle::Dpdk(dp) => dp
+                .next_frame()
+                .map(|opt| opt.map(AnyFrame::Dpdk)),
         }
     }
 
@@ -424,6 +491,11 @@ impl Dataplane for DataplaneHandle {
                 AnyFrame::AfXdp(frame) => dp.send_frame(frame),
                 _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            DataplaneHandle::Dpdk(dp) => match frame {
+                AnyFrame::Dpdk(frame) => dp.send_frame(frame),
+                _ => Err(DataplaneError::Unsupported("frame type mismatch")),
+            },
         }
     }
 
@@ -433,6 +505,8 @@ impl Dataplane for DataplaneHandle {
             DataplaneHandle::Pcap(dp) => dp.stats(),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             DataplaneHandle::AfXdp(dp) => dp.stats(),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            DataplaneHandle::Dpdk(dp) => dp.stats(),
         }
     }
 
@@ -442,6 +516,8 @@ impl Dataplane for DataplaneHandle {
             DataplaneHandle::Pcap(dp) => dp.configure_rss(rss),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             DataplaneHandle::AfXdp(dp) => dp.configure_rss(rss),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            DataplaneHandle::Dpdk(dp) => dp.configure_rss(rss),
         }
     }
 
@@ -451,6 +527,8 @@ impl Dataplane for DataplaneHandle {
             DataplaneHandle::Pcap(dp) => dp.capabilities(),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             DataplaneHandle::AfXdp(dp) => dp.capabilities(),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            DataplaneHandle::Dpdk(dp) => dp.capabilities(),
         }
     }
 }
@@ -482,6 +560,17 @@ mod tests {
         assert!(rss.enabled);
         assert!(rss.hash_fields.contains(&RssHashField::Ipv4));
         assert!(rss.hash_fields.contains(&RssHashField::Tcp));
+    }
+
+    #[test]
+    fn dpdk_defaults_cover_core_tuning() {
+        let dpdk = DpdkConfig::default();
+        assert_eq!(dpdk.mem_channels, 4);
+        assert_eq!(dpdk.rx_desc, 1024);
+        assert_eq!(dpdk.tx_desc, 1024);
+        assert_eq!(dpdk.rx_burst, 32);
+        assert_eq!(dpdk.tx_burst, 32);
+        assert!(dpdk.promisc);
     }
 
     #[test]

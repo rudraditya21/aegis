@@ -1,0 +1,15 @@
+[package]
+name = "aegis-dpdk"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+dpdk = []
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.0"
+pkg-config = "0.3"
