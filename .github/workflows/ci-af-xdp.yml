@@ -1,0 +1,23 @@
+name: ci-af-xdp
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build CI container
+        run: docker build -f docker/Dockerfile.ci -t aegis-ci .
+
+      - name: Rust tests (af-xdp)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            aegis-ci \
+            bash docker/run_ci_tests.sh af-xdp

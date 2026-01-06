@@ -111,7 +111,7 @@ spawns queue-affine workers; for pcap it uses software hashing to shard flows ac
 - Dataplane readiness: `cargo run -p aegis -- dataplane-diag`
 - Metrics (include dataplane stats with `--iface`): `cargo run -p aegis -- metrics --rules /etc/aegis/rules/l3l4.rules --iface eth0`
 - Per-core worker balance (live traffic): `cargo run -p aegis -- capture --rules /etc/aegis/rules/l3l4.rules --iface eth0 --count 10000 --worker-stats`
-- CI build matrix: `.github/workflows/ci.yml` builds `pcap`, `af-xdp`, and `dpdk` on Linux.
+- CI workflows: `.github/workflows/ci-pcap.yml`, `.github/workflows/ci-af-xdp.yml`, and `.github/workflows/ci-dpdk.yml`.
 
 ### Docker Test Runs
 
