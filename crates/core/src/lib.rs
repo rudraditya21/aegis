@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
+use arc_swap::ArcSwap;
 use chrono::Timelike;
 use packet_parser::{IpProtocol, ParseError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 mod flow;
@@ -567,7 +572,7 @@ pub struct PacketMetadata {
     pub tls: Option<TlsMetadata>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Firewall {
     rules: Vec<(u64, Rule)>,
     next_rule_id: u64,
@@ -599,6 +604,18 @@ impl Firewall {
         Self::default()
     }
 
+    pub fn from_rules(rules: &[(u64, Rule)]) -> Self {
+        let mut fw = Firewall::new();
+        let mut max_id = 0u64;
+        for (id, rule) in rules {
+            fw.rules.push((*id, rule.clone()));
+            fw.apply_rule(rule);
+            max_id = max_id.max(*id);
+        }
+        fw.next_rule_id = max_id.saturating_add(1).max(1);
+        fw
+    }
+
     pub fn add_rule(&mut self, rule: Rule) -> u64 {
         let id = self.next_rule_id;
         self.next_rule_id += 1;
@@ -619,6 +636,10 @@ impl Firewall {
 
     pub fn list_rules(&self) -> &[(u64, Rule)] {
         &self.rules
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
     }
 
     fn rebuild(&mut self) {
@@ -758,6 +779,87 @@ impl Firewall {
             }
         }
         None
+    }
+}
+
+#[derive(Debug)]
+struct RuleCache {
+    rules: Vec<(u64, Rule)>,
+    next_rule_id: u64,
+    per_core: Vec<ArcSwap<Firewall>>,
+    epoch: AtomicU64,
+}
+
+impl RuleCache {
+    fn new(shards: usize) -> Self {
+        let shards = shards.max(1);
+        let mut per_core = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            per_core.push(ArcSwap::from(Arc::new(Firewall::new())));
+        }
+        RuleCache {
+            rules: Vec::new(),
+            next_rule_id: 1,
+            per_core,
+            epoch: AtomicU64::new(1),
+        }
+    }
+
+    fn add_rule(&mut self, rule: Rule) -> u64 {
+        let id = self.next_rule_id;
+        self.next_rule_id = self.next_rule_id.saturating_add(1);
+        self.rules.push((id, rule));
+        self.rebuild();
+        id
+    }
+
+    fn remove_rule(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.rules.iter().position(|(rid, _)| *rid == id) {
+            self.rules.remove(pos);
+            self.rebuild();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn list_rules(&self) -> &[(u64, Rule)] {
+        &self.rules
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn rules_for_shard(&self, shard_idx: usize) -> Arc<Firewall> {
+        let idx = shard_idx % self.per_core.len().max(1);
+        self.per_core[idx].load_full()
+    }
+
+    fn resize(&mut self, shards: usize) {
+        let shards = shards.max(1);
+        if self.per_core.len() == shards {
+            return;
+        }
+        let base = Firewall::from_rules(&self.rules);
+        let mut per_core = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            per_core.push(ArcSwap::from(Arc::new(base.clone())));
+        }
+        self.per_core = per_core;
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn rebuild(&mut self) {
+        let base = Firewall::from_rules(&self.rules);
+        for slot in &self.per_core {
+            slot.store(Arc::new(base.clone()));
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1035,7 +1137,7 @@ pub struct Evaluation {
 
 #[derive(Debug)]
 pub struct FirewallManager {
-    firewall: Firewall,
+    rule_cache: RuleCache,
     flows: FlowTable,
     protector: AttackProtector,
     behavior: BehaviorDetector,
@@ -1098,8 +1200,9 @@ impl FirewallManager {
             Some(shards) => FlowTable::with_shards(flow_capacity, shards),
             None => FlowTable::new(flow_capacity),
         };
+        let rule_cache = RuleCache::new(flows.shard_count());
         FirewallManager {
-            firewall: Firewall::new(),
+            rule_cache,
             flows,
             protector: AttackProtector::new(),
             behavior: BehaviorDetector::new(),
@@ -1142,15 +1245,19 @@ impl FirewallManager {
     }
 
     pub fn add_rule(&mut self, rule: Rule) -> u64 {
-        self.firewall.add_rule(rule)
+        self.rule_cache.add_rule(rule)
     }
 
     pub fn remove_rule(&mut self, id: u64) -> bool {
-        self.firewall.remove_rule(id)
+        self.rule_cache.remove_rule(id)
     }
 
     pub fn rules(&self) -> &[(u64, Rule)] {
-        self.firewall.list_rules()
+        self.rule_cache.list_rules()
+    }
+
+    pub fn rule_cache_epoch(&self) -> u64 {
+        self.rule_cache.epoch()
     }
 
     pub fn export_flow_state(&self) -> FlowSyncState {
@@ -1163,6 +1270,7 @@ impl FirewallManager {
 
     pub fn set_flow_capacity(&mut self, capacity: usize) {
         self.flows.set_capacity(capacity);
+        self.rule_cache.resize(self.flows.shard_count());
     }
 
     pub fn set_reassembly_buffer(&mut self, bytes: usize) {
@@ -1240,19 +1348,22 @@ impl FirewallManager {
     ) -> Evaluation {
         let mut meta = self.enrich_metadata(meta);
         let flow_key = FlowKey::from_metadata(&meta);
+        let shard_idx = self.flows.shard_for_key(&flow_key);
+        let ruleset = self.rule_cache.rules_for_shard(shard_idx);
         let iface_allowed = self.interface_allowed(interface);
-        let base_action = if self.firewall.rules.is_empty() {
+        let has_rules = !self.rule_cache.is_empty();
+        let base_action = if !has_rules {
             match self.fail_mode {
                 FailMode::FailOpen => Action::Allow,
                 FailMode::FailClosed => Action::Deny,
             }
         } else if iface_allowed {
-            self.firewall.evaluate(&meta)
+            ruleset.evaluate(&meta)
         } else {
             Action::Deny
         };
         let mut action = base_action.clone();
-        let mut matched_rule = if self.firewall.rules.is_empty() {
+        let mut matched_rule = if !has_rules {
             None
         } else {
             self.matching_rule_id(&meta, &base_action)
@@ -1716,7 +1827,7 @@ impl FirewallManager {
     }
 
     fn matching_rule_id(&self, meta: &PacketMetadata, action: &Action) -> Option<u64> {
-        for (id, rule) in &self.firewall.rules {
+        for (id, rule) in self.rule_cache.list_rules() {
             if &rule.action != action || rule.direction != meta.direction {
                 continue;
             }
@@ -2189,6 +2300,22 @@ mod tests {
         assert!(mgr.remove_rule(drop_id));
         assert!(mgr.rules().iter().all(|(id, _)| *id != drop_id));
         assert!(mgr.rules().iter().any(|(id, _)| *id == allow_id));
+    }
+
+    #[test]
+    fn rule_cache_epoch_bumps_on_updates() {
+        let mut mgr = FirewallManager::new(8);
+        let epoch0 = mgr.rule_cache_epoch();
+        let rule_id = mgr.add_rule(Rule {
+            action: Action::Allow,
+            subject: RuleSubject::Default,
+            direction: Direction::Ingress,
+        });
+        let epoch1 = mgr.rule_cache_epoch();
+        assert!(epoch1 > epoch0);
+        assert!(mgr.remove_rule(rule_id));
+        let epoch2 = mgr.rule_cache_epoch();
+        assert!(epoch2 > epoch1);
     }
 
     #[test]

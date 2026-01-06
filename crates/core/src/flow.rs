@@ -373,6 +373,14 @@ impl FlowTable {
         self.shards.iter().map(FlowShard::len).sum()
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shards.len().max(1)
+    }
+
+    pub fn shard_for_key(&self, key: &FlowKey) -> usize {
+        self.select_shard(key)
+    }
+
     pub fn contains(&self, key: &FlowKey) -> bool {
         let idx = self.select_shard(key);
         self.shards

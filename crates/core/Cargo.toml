@@ -8,3 +8,4 @@ config = { package = "aegis-config", path = "../config" }
 packet-parser = { path = "../packet-parser" }
 aho-corasick = "1.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+arc-swap = "1.7"
