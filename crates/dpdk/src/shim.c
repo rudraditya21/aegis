@@ -156,7 +156,7 @@ int aegis_dpdk_rss_configure(uint16_t port_id,
 
     uint16_t reta_size = info.reta_size;
     uint16_t reta_conf_size =
-        (uint16_t)((reta_size + RTE_RETA_GROUP_SIZE - 1) / RTE_RETA_GROUP_SIZE);
+        (uint16_t)((reta_size + RTE_ETH_RETA_GROUP_SIZE - 1) / RTE_ETH_RETA_GROUP_SIZE);
     struct rte_eth_rss_reta_entry64 *reta_conf =
         calloc(reta_conf_size, sizeof(*reta_conf));
     if (!reta_conf) {
@@ -165,8 +165,8 @@ int aegis_dpdk_rss_configure(uint16_t port_id,
     }
 
     for (uint16_t i = 0; i < reta_size; i++) {
-        uint16_t idx = (uint16_t)(i / RTE_RETA_GROUP_SIZE);
-        uint16_t shift = (uint16_t)(i % RTE_RETA_GROUP_SIZE);
+        uint16_t idx = (uint16_t)(i / RTE_ETH_RETA_GROUP_SIZE);
+        uint16_t shift = (uint16_t)(i % RTE_ETH_RETA_GROUP_SIZE);
         reta_conf[idx].mask |= (uint64_t)(1ULL << shift);
         reta_conf[idx].reta[shift] = queues[i % queue_len];
     }

@@ -142,9 +142,9 @@ pub use stub::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode};
 
 #[cfg(target_os = "linux")]
 mod linux {
-use super::{AfXdpConfig, AfXdpError};
+use super::{AfXdpConfig, AfXdpError, AfXdpStats, PinnedXdp};
 use libc::{
-    c_int, c_uint, c_ulong, c_void, pollfd, sockaddr, socklen_t, AF_NETLINK, AF_XDP,
+    c_int, c_ulong, c_void, pollfd, sockaddr, socklen_t, AF_NETLINK, AF_XDP,
     MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT,
     NETLINK_ROUTE, POLLIN, PROT_READ, PROT_WRITE, SOCK_RAW,
 };
@@ -155,7 +155,7 @@ use std::fs;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{fence, Ordering};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const XDP_UMEM_REG: c_int = 1;
 const XDP_UMEM_FILL_RING: c_int = 4;
@@ -382,6 +382,16 @@ struct SockaddrXdp {
 }
 
 #[repr(C)]
+struct IfInfoMsg {
+    ifi_family: u8,
+    __ifi_pad: u8,
+    ifi_type: u16,
+    ifi_index: i32,
+    ifi_flags: u32,
+    ifi_change: u32,
+}
+
+#[repr(C)]
 struct NlAttr {
     nla_len: u16,
     nla_type: u16,
@@ -595,7 +605,7 @@ impl AfXdpDataplane {
         if rc != 0 {
             unsafe {
                 libc::close(sock);
-                libc::munmap(umem_base, umem_len);
+                libc::munmap(umem_base as *mut c_void, umem_len);
             }
             return Err(AfXdpError::Backend(errno_msg("setsockopt(XDP_UMEM_REG)")));
         }
@@ -644,7 +654,7 @@ impl AfXdpDataplane {
         if rc != 0 {
             unsafe {
                 libc::close(sock);
-                libc::munmap(umem_base, umem_len);
+                libc::munmap(umem_base as *mut c_void, umem_len);
             }
             return Err(AfXdpError::Backend(errno_msg("getsockopt(XDP_MMAP_OFFSETS)")));
         }
@@ -687,13 +697,13 @@ impl AfXdpDataplane {
             libc::bind(
                 sock,
                 &sxdp as *const _ as *const sockaddr,
-                size_of::<sockaddr_xdp>() as socklen_t,
+                size_of::<SockaddrXdp>() as socklen_t,
             )
         };
         if rc != 0 {
             unsafe {
                 libc::close(sock);
-                libc::munmap(umem_base, umem_len);
+                libc::munmap(umem_base as *mut c_void, umem_len);
             }
             return Err(AfXdpError::Backend(errno_msg("bind(AF_XDP)")));
         }
@@ -1210,15 +1220,15 @@ fn attach_xdp_fd(ifindex: u32, prog_fd: RawFd, flags: XdpAttachFlags) -> Result<
         return Err(AfXdpError::Backend(errno_msg("socket(AF_NETLINK)")));
     }
     let mut req = Vec::new();
-    let nlmsg_len = size_of::<libc::nlmsghdr>() + size_of::<libc::ifinfomsg>();
+    let nlmsg_len = size_of::<libc::nlmsghdr>() + size_of::<IfInfoMsg>();
     let mut hdr = libc::nlmsghdr {
         nlmsg_len: nlmsg_len as u32,
         nlmsg_type: libc::RTM_SETLINK,
-        nlmsg_flags: libc::NLM_F_REQUEST | libc::NLM_F_ACK,
+        nlmsg_flags: (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
         nlmsg_seq: 1,
         nlmsg_pid: 0,
     };
-    let ifi = libc::ifinfomsg {
+    let ifi = IfInfoMsg {
         ifi_family: libc::AF_UNSPEC as u8,
         __ifi_pad: 0,
         ifi_type: 0,
@@ -1233,7 +1243,7 @@ fn attach_xdp_fd(ifindex: u32, prog_fd: RawFd, flags: XdpAttachFlags) -> Result<
         )
     });
     req.extend_from_slice(unsafe {
-        slice::from_raw_parts(&ifi as *const _ as *const u8, size_of::<libc::ifinfomsg>())
+        slice::from_raw_parts(&ifi as *const _ as *const u8, size_of::<IfInfoMsg>())
     });
 
     let mut xdp_attrs = Vec::new();
