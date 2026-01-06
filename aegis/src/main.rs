@@ -113,6 +113,7 @@ fn main() {
         }
         "capture-async" => cmd_capture_async(args.collect()),
         "replay" => cmd_replay(args.collect()),
+        "dataplane-diag" => cmd_dataplane_diag(args.collect()),
         _ => Err(format!("Unknown command: {}", cmd)),
     };
 
@@ -1543,11 +1544,13 @@ fn cmd_failover(args: Vec<String>) -> Result<(), String> {
 fn cmd_metrics(args: Vec<String>) -> Result<(), String> {
     let mut rules_path: Option<String> = None;
     let mut policies_path: Option<String> = None;
+    let mut iface: Option<String> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--rules" => rules_path = iter.next().cloned(),
             "--policies" => policies_path = iter.next().cloned(),
+            "--iface" => iface = iter.next().cloned(),
             other => return Err(format!("Unknown flag {other}")),
         }
     }
@@ -1575,6 +1578,345 @@ fn cmd_metrics(args: Vec<String>) -> Result<(), String> {
         mgr.threat_intel_updated_at()
     );
     println!("Protocol counters: {:?}", mgr.protocol_counters());
+    if let Err(err) = print_dataplane_metrics(iface.as_deref()) {
+        eprintln!("Dataplane metrics unavailable: {err}");
+    }
+    Ok(())
+}
+
+fn print_dataplane_metrics(iface: Option<&str>) -> Result<(), String> {
+    let runtime = load_runtime_config(&config_root())?;
+    let dp_cfg = runtime.dataplane;
+    println!("Dataplane backend: {:?}", dp_cfg.backend);
+    let iface = match iface {
+        Some(name) => name,
+        None => {
+            println!("Dataplane stats: skipped (missing --iface)");
+            return Ok(());
+        }
+    };
+    let mut dp =
+        DataplaneHandle::open_live(iface, &dp_cfg).map_err(|e| format!("open dataplane: {e}"))?;
+    let stats = dp
+        .stats()
+        .map_err(|e| format!("dataplane stats: {e}"))?;
+    println!(
+        "Dataplane stats received={} dropped={} if_dropped={} tx={}",
+        stats.received, stats.dropped, stats.if_dropped, stats.transmitted
+    );
+    match &mut dp {
+        #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+        DataplaneHandle::AfXdp(inner) => {
+            let stats = inner
+                .stats()
+                .map_err(|e| format!("af-xdp stats: {e}"))?;
+            println!(
+                "AF_XDP UMEM len={} hugepages={} numa_node={:?}",
+                stats.umem_len, stats.umem_hugepages, stats.umem_numa_node
+            );
+        }
+        #[cfg(all(feature = "dpdk", target_os = "linux"))]
+        DataplaneHandle::Dpdk(inner) => {
+            let stats = inner.stats().map_err(|e| format!("dpdk stats: {e}"))?;
+            println!(
+                "DPDK hugepages={} mempool_socket={:?} port_socket={:?}",
+                stats.hugepages, stats.mempool_socket, stats.port_socket
+            );
+        }
+        #[cfg(feature = "pcap")]
+        DataplaneHandle::Pcap(_) => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HugepageInfo {
+    total: u64,
+    free: u64,
+    size_kb: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn read_hugepage_info() -> Result<HugepageInfo, String> {
+    let body = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|e| format!("read /proc/meminfo: {e}"))?;
+    let mut total = None;
+    let mut free = None;
+    let mut size_kb = None;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("HugePages_Total:") {
+            total = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("HugePages_Free:") {
+            free = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+            size_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        }
+    }
+    match (total, free, size_kb) {
+        (Some(total), Some(free), Some(size_kb)) => Ok(HugepageInfo {
+            total,
+            free,
+            size_kb,
+        }),
+        _ => Err("hugepage info missing in /proc/meminfo".into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_hugepage_info() -> Result<HugepageInfo, String> {
+    Err("hugepage info only available on linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn list_numa_nodes() -> Result<Vec<u32>, String> {
+    let root = std::path::Path::new("/sys/devices/system/node");
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("read {}: {e}", root.display()))?;
+    let mut nodes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read node entry: {e}"))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix("node") {
+            if let Ok(id) = rest.parse::<u32>() {
+                nodes.push(id);
+            }
+        }
+    }
+    nodes.sort_unstable();
+    if nodes.is_empty() {
+        return Err("no NUMA nodes found in sysfs".into());
+    }
+    Ok(nodes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn list_numa_nodes() -> Result<Vec<u32>, String> {
+    Err("NUMA info only available on linux".into())
+}
+
+fn cmd_dataplane_diag(args: Vec<String>) -> Result<(), String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        return Err(format!("Unknown flag {arg}"));
+    }
+    let runtime = load_runtime_config(&config_root())?;
+    let dp_cfg = runtime.dataplane;
+    println!("Dataplane backend: {:?}", dp_cfg.backend);
+
+    let mut warnings: Vec<String> = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
+
+    let hugepages = read_hugepage_info();
+    match &hugepages {
+        Ok(info) => println!(
+            "Hugepages total={} free={} size_kb={}",
+            info.total, info.free, info.size_kb
+        ),
+        Err(err) => println!("Hugepages: unavailable ({err})"),
+    }
+
+    let numa_nodes = list_numa_nodes();
+    match &numa_nodes {
+        Ok(nodes) => println!("NUMA nodes: {:?}", nodes),
+        Err(err) => println!("NUMA nodes: unavailable ({err})"),
+    }
+
+    match dp_cfg.backend {
+        BackendKind::Pcap => {
+            println!("Backend pcap: no hugepage or NUMA validation required.");
+        }
+        BackendKind::AfXdp => {
+            if !cfg!(target_os = "linux") {
+                issues.push("af-xdp backend requires linux".into());
+            }
+            let cfg = dp_cfg.af_xdp.clone().unwrap_or_default();
+            validate_af_xdp_diag(&cfg, &hugepages, &numa_nodes, &mut warnings, &mut issues)?;
+        }
+        BackendKind::Dpdk => {
+            if !cfg!(target_os = "linux") {
+                issues.push("dpdk backend requires linux".into());
+            }
+            let cfg = dp_cfg.dpdk.clone().unwrap_or_default();
+            validate_dpdk_diag(&cfg, &hugepages, &numa_nodes, &mut warnings, &mut issues)?;
+        }
+    }
+
+    if !warnings.is_empty() {
+        println!("Warnings:");
+        for warn in warnings {
+            println!("- {warn}");
+        }
+    }
+    if !issues.is_empty() {
+        println!("Issues:");
+        for issue in issues {
+            println!("- {issue}");
+        }
+        return Err("dataplane diagnostics failed".into());
+    }
+
+    println!("Dataplane diagnostics: OK");
+    Ok(())
+}
+
+fn validate_af_xdp_diag(
+    cfg: &dataplane::AfXdpConfig,
+    hugepages: &Result<HugepageInfo, String>,
+    numa_nodes: &Result<Vec<u32>, String>,
+    warnings: &mut Vec<String>,
+    issues: &mut Vec<String>,
+) -> Result<(), String> {
+    let frame_size = cfg.frame_size.max(2048);
+    let frames = cfg.umem_frames.max(2048).next_power_of_two();
+    let umem_len = frame_size
+        .checked_mul(frames)
+        .ok_or_else(|| "umem size overflow".to_string())?;
+
+    if cfg.use_hugepages {
+        match hugepages {
+            Ok(info) => {
+                let expected = cfg.hugepage_size_kb.unwrap_or(info.size_kb);
+                if expected != info.size_kb {
+                    let msg = format!(
+                        "af-xdp hugepage size {}kb does not match system {}kb",
+                        expected, info.size_kb
+                    );
+                    if cfg.hugepage_fallback {
+                        warnings.push(msg);
+                    } else {
+                        issues.push(msg);
+                    }
+                }
+                let size_bytes = expected.saturating_mul(1024);
+                if size_bytes == 0 {
+                    issues.push("af-xdp hugepage size invalid".into());
+                } else if umem_len % size_bytes != 0 {
+                    let msg = format!(
+                        "af-xdp umem len {} not aligned to {} bytes",
+                        umem_len, size_bytes
+                    );
+                    if cfg.hugepage_fallback {
+                        warnings.push(msg);
+                    } else {
+                        issues.push(msg);
+                    }
+                } else {
+                    let needed = (umem_len + size_bytes - 1) / size_bytes;
+                    if info.free < needed as u64 {
+                        let msg = format!(
+                            "af-xdp needs {} hugepages, only {} free",
+                            needed, info.free
+                        );
+                        if cfg.hugepage_fallback {
+                            warnings.push(msg);
+                        } else {
+                            issues.push(msg);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let msg = format!("af-xdp hugepage info unavailable: {err}");
+                if cfg.hugepage_fallback {
+                    warnings.push(msg);
+                } else {
+                    issues.push(msg);
+                }
+            }
+        }
+    }
+
+    if let Some(node) = cfg.numa_node {
+        match numa_nodes {
+            Ok(nodes) => {
+                if !nodes.contains(&(node as u32)) {
+                    let msg = format!("af-xdp NUMA node {node} not present");
+                    if cfg.numa_fallback {
+                        warnings.push(msg);
+                    } else {
+                        issues.push(msg);
+                    }
+                }
+            }
+            Err(err) => {
+                let msg = format!("af-xdp NUMA info unavailable: {err}");
+                if cfg.numa_fallback {
+                    warnings.push(msg);
+                } else {
+                    issues.push(msg);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_dpdk_diag(
+    cfg: &dataplane::DpdkConfig,
+    hugepages: &Result<HugepageInfo, String>,
+    numa_nodes: &Result<Vec<u32>, String>,
+    warnings: &mut Vec<String>,
+    issues: &mut Vec<String>,
+) -> Result<(), String> {
+    let max_queues = cfg.rx_queues.max(cfg.tx_queues).max(1) as usize;
+    if let Some(queues) = &cfg.queue_sockets {
+        if queues.is_empty() {
+            issues.push("dpdk queue-sockets cannot be empty".into());
+        } else if queues.len() != 1 && queues.len() != max_queues {
+            issues.push("dpdk queue-sockets length must be 1 or match max queues".into());
+        }
+    }
+
+    if let Some(node) = cfg.socket_id {
+        if let Ok(nodes) = numa_nodes {
+            if !nodes.contains(&(node as u32)) {
+                issues.push(format!("dpdk socket-id {node} not present"));
+            }
+        }
+    }
+    if let Some(queues) = &cfg.queue_sockets {
+        if let Ok(nodes) = numa_nodes {
+            for node in queues {
+                if !nodes.contains(&(*node as u32)) {
+                    issues.push(format!("dpdk queue-sockets node {node} not present"));
+                }
+            }
+        }
+    }
+    if cfg.socket_id.is_some() || cfg.queue_sockets.is_some() {
+        if numa_nodes.is_err() {
+            warnings.push("dpdk NUMA nodes unavailable; cannot validate sockets".into());
+        }
+    }
+
+    let hugepages_enabled = !cfg.no_huge
+        && !cfg.eal_args.iter().any(|arg| arg == "--no-huge");
+    if hugepages_enabled {
+        match hugepages {
+            Ok(info) => {
+                if info.total == 0 || info.free == 0 {
+                    let msg = format!(
+                        "dpdk hugepages unavailable (total={}, free={})",
+                        info.total, info.free
+                    );
+                    if cfg.hugepage_fallback {
+                        warnings.push(msg);
+                    } else {
+                        issues.push(msg);
+                    }
+                }
+            }
+            Err(err) => {
+                let msg = format!("dpdk hugepage info unavailable: {err}");
+                if cfg.hugepage_fallback {
+                    warnings.push(msg);
+                } else {
+                    issues.push(msg);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2097,6 +2439,8 @@ fn print_usage_and_exit() {
         "  aegis eval --rules rules.txt --direction ingress --hex \"<hex bytes>\" [--iface eth0] [--disable-iface eth0] [--no-logs]"
     );
     eprintln!("  aegis capture --rules rules.txt --iface eth0 [--count 10] [--no-logs]");
+    eprintln!("  aegis metrics --rules rules.txt [--policies policies.txt] [--iface eth0]");
+    eprintln!("  aegis dataplane-diag");
     std::process::exit(1);
 }
 

@@ -98,6 +98,11 @@ pub struct AfXdpConfig {
     pub frame_size: usize,
     pub headroom: usize,
     pub use_need_wakeup: bool,
+    pub numa_node: Option<i32>,
+    pub use_hugepages: bool,
+    pub hugepage_size_kb: Option<usize>,
+    pub hugepage_fallback: bool,
+    pub numa_fallback: bool,
     pub xdp_program_pin: Option<String>,
     pub xsk_map_pin: Option<String>,
     pub pin_dir: Option<String>,
@@ -117,6 +122,11 @@ impl Default for AfXdpConfig {
             frame_size: 2048,
             headroom: 256,
             use_need_wakeup: false,
+            numa_node: None,
+            use_hugepages: false,
+            hugepage_size_kb: None,
+            hugepage_fallback: true,
+            numa_fallback: true,
             xdp_program_pin: None,
             xsk_map_pin: None,
             pin_dir: None,
@@ -151,9 +161,11 @@ pub struct DpdkConfig {
     pub mbuf_count: usize,
     pub mbuf_cache: usize,
     pub socket_id: Option<u16>,
+    pub queue_sockets: Option<Vec<u16>>,
     pub core_mask: Option<String>,
     pub mem_channels: u32,
     pub no_huge: bool,
+    pub hugepage_fallback: bool,
     pub file_prefix: Option<String>,
     pub eal_args: Vec<String>,
     pub rx_desc: u16,
@@ -174,9 +186,11 @@ impl Default for DpdkConfig {
             mbuf_count: 8192,
             mbuf_cache: 256,
             socket_id: None,
+            queue_sockets: None,
             core_mask: None,
             mem_channels: 4,
             no_huge: false,
+            hugepage_fallback: true,
             file_prefix: None,
             eal_args: Vec::new(),
             rx_desc: 1024,
@@ -385,6 +399,11 @@ impl DataplaneHandle {
                         frame_size: af_cfg.frame_size,
                         headroom: af_cfg.headroom,
                         use_need_wakeup: af_cfg.use_need_wakeup,
+                        numa_node: af_cfg.numa_node,
+                        use_hugepages: af_cfg.use_hugepages,
+                        hugepage_size_kb: af_cfg.hugepage_size_kb,
+                        hugepage_fallback: af_cfg.hugepage_fallback,
+                        numa_fallback: af_cfg.numa_fallback,
                     };
                     let mut dp = AfXdpDataplane::open_live(iface, &inner_cfg).map_err(|e| {
                         DataplaneError::Backend(format!("af-xdp init: {e}"))
@@ -437,9 +456,14 @@ impl DataplaneHandle {
                         mbuf_count: dpdk_cfg.mbuf_count,
                         mbuf_cache: dpdk_cfg.mbuf_cache,
                         socket_id: dpdk_cfg.socket_id.map(|v| v as i32),
+                        queue_sockets: dpdk_cfg
+                            .queue_sockets
+                            .clone()
+                            .map(|v| v.into_iter().map(|s| s as i32).collect()),
                         core_mask: dpdk_cfg.core_mask.clone(),
                         mem_channels: dpdk_cfg.mem_channels,
                         no_huge: dpdk_cfg.no_huge,
+                        hugepage_fallback: dpdk_cfg.hugepage_fallback,
                         file_prefix: dpdk_cfg.file_prefix.clone(),
                         eal_args: dpdk_cfg.eal_args.clone(),
                         rx_desc: dpdk_cfg.rx_desc,
@@ -580,6 +604,18 @@ mod tests {
         assert_eq!(dpdk.rx_burst, 32);
         assert_eq!(dpdk.tx_burst, 32);
         assert!(dpdk.promisc);
+        assert!(dpdk.queue_sockets.is_none());
+        assert!(dpdk.hugepage_fallback);
+    }
+
+    #[test]
+    fn af_xdp_defaults_cover_numa_and_hugepages() {
+        let cfg = AfXdpConfig::default();
+        assert!(cfg.numa_node.is_none());
+        assert!(!cfg.use_hugepages);
+        assert!(cfg.hugepage_size_kb.is_none());
+        assert!(cfg.hugepage_fallback);
+        assert!(cfg.numa_fallback);
     }
 
     #[test]

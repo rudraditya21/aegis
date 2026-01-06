@@ -3,6 +3,12 @@ name = "aegis"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["pcap"]
+pcap = ["dataplane/pcap"]
+af-xdp = ["dataplane/af-xdp"]
+dpdk = ["dataplane/dpdk"]
+
 [dependencies]
 packet-parser = { path = "../crates/packet-parser" }
 aegis-core = { path = "../crates/core" }

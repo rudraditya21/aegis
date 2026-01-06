@@ -7,6 +7,11 @@ pub struct AfXdpConfig {
     pub frame_size: usize,
     pub headroom: usize,
     pub use_need_wakeup: bool,
+    pub numa_node: Option<i32>,
+    pub use_hugepages: bool,
+    pub hugepage_size_kb: Option<usize>,
+    pub hugepage_fallback: bool,
+    pub numa_fallback: bool,
 }
 
 impl Default for AfXdpConfig {
@@ -17,6 +22,11 @@ impl Default for AfXdpConfig {
             frame_size: 2048,
             headroom: 256,
             use_need_wakeup: false,
+            numa_node: None,
+            use_hugepages: false,
+            hugepage_size_kb: None,
+            hugepage_fallback: true,
+            numa_fallback: true,
         }
     }
 }
@@ -48,6 +58,9 @@ pub struct AfXdpStats {
     pub rx_ring_full: u64,
     pub rx_fill_ring_empty: u64,
     pub tx_ring_empty: u64,
+    pub umem_hugepages: bool,
+    pub umem_numa_node: Option<i32>,
+    pub umem_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -131,13 +144,14 @@ pub use stub::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode};
 mod linux {
 use super::{AfXdpConfig, AfXdpError};
 use libc::{
-    c_int, c_void, pollfd, sockaddr, socklen_t, AF_NETLINK, AF_XDP, MAP_ANONYMOUS, MAP_FAILED,
-    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT, NETLINK_ROUTE, POLLIN, PROT_READ,
-    PROT_WRITE, SOCK_RAW,
+    c_int, c_uint, c_ulong, c_void, pollfd, sockaddr, socklen_t, AF_NETLINK, AF_XDP,
+    MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT,
+    NETLINK_ROUTE, POLLIN, PROT_READ, PROT_WRITE, SOCK_RAW,
 };
 use std::ffi::CString;
 use std::mem::{self, size_of};
 use std::os::fd::RawFd;
+use std::fs;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{fence, Ordering};
@@ -191,6 +205,171 @@ const XDP_MD_RX_QUEUE_INDEX: i16 = 16;
 const IFLA_XDP: u16 = 43;
 const IFLA_XDP_FD: u16 = 1;
 const IFLA_XDP_FLAGS: u16 = 3;
+const MPOL_BIND: c_int = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct HugepageInfo {
+    free: u64,
+    size_kb: usize,
+}
+
+fn hugepage_info() -> Option<HugepageInfo> {
+    let body = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut free = None;
+    let mut size_kb = None;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("HugePages_Free:") {
+            free = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+            size_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        }
+    }
+    match (free, size_kb) {
+        (Some(free), Some(size_kb)) => Some(HugepageInfo { free, size_kb }),
+        _ => None,
+    }
+}
+
+fn bind_memory(ptr: *mut c_void, len: usize, node: i32) -> Result<(), AfXdpError> {
+    if node < 0 {
+        return Err(AfXdpError::Config("numa_node must be >= 0".into()));
+    }
+    let bits = (size_of::<c_ulong>() * 8) as usize;
+    let node = node as usize;
+    let words = (node / bits) + 1;
+    let mut mask = vec![0 as c_ulong; words];
+    let idx = node / bits;
+    let bit = node % bits;
+    mask[idx] |= 1u64 << bit;
+    let maxnode = (words * bits) as c_ulong;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            ptr,
+            len,
+            MPOL_BIND,
+            mask.as_ptr(),
+            maxnode,
+            0u32,
+        )
+    };
+    if rc != 0 {
+        return Err(AfXdpError::Backend(errno_msg("mbind(umem)")));
+    }
+    Ok(())
+}
+
+fn allocate_umem(cfg: &AfXdpConfig, len: usize) -> Result<(*mut u8, bool, Option<i32>), AfXdpError> {
+    let mut use_huge = cfg.use_hugepages;
+    let mut page_size = None;
+    if use_huge {
+        match hugepage_info() {
+            Some(info) => {
+                let expected = cfg.hugepage_size_kb.unwrap_or(info.size_kb);
+                if expected != info.size_kb {
+                    if cfg.hugepage_fallback {
+                        use_huge = false;
+                    } else {
+                        return Err(AfXdpError::Config(
+                            "hugepage size does not match system".into(),
+                        ));
+                    }
+                } else {
+                    let size_bytes = expected.saturating_mul(1024);
+                    if size_bytes == 0 {
+                        if cfg.hugepage_fallback {
+                            use_huge = false;
+                        } else {
+                            return Err(AfXdpError::Config("invalid hugepage size".into()));
+                        }
+                    } else {
+                        let needed = (len + size_bytes - 1) / size_bytes;
+                        if info.free < needed as u64 {
+                            if cfg.hugepage_fallback {
+                                use_huge = false;
+                            } else {
+                                return Err(AfXdpError::Config(
+                                    "insufficient hugepages available".into(),
+                                ));
+                            }
+                        }
+                        if len % size_bytes != 0 {
+                            if cfg.hugepage_fallback {
+                                use_huge = false;
+                            } else {
+                                return Err(AfXdpError::Config(
+                                    "umem length not hugepage aligned".into(),
+                                ));
+                            }
+                        }
+                        page_size = Some(size_bytes);
+                    }
+                }
+            }
+            None => {
+                if cfg.hugepage_fallback {
+                    use_huge = false;
+                } else {
+                    return Err(AfXdpError::Config(
+                        "hugepage info unavailable".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+    if use_huge {
+        flags |= MAP_HUGETLB;
+    }
+    let mut ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            flags,
+            -1,
+            0,
+        )
+    };
+    if ptr == MAP_FAILED && use_huge && cfg.hugepage_fallback {
+        use_huge = false;
+        flags &= !MAP_HUGETLB;
+        ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+    }
+    if ptr == MAP_FAILED {
+        return Err(AfXdpError::Backend(errno_msg("mmap(umem)")));
+    }
+
+    let mut numa_node = None;
+    if let Some(node) = cfg.numa_node {
+        match bind_memory(ptr, len, node) {
+            Ok(()) => numa_node = Some(node),
+            Err(err) => {
+                if cfg.numa_fallback {
+                    numa_node = None;
+                } else {
+                    unsafe {
+                        libc::munmap(ptr, len);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    let _ = page_size;
+    Ok((ptr as *mut u8, use_huge, numa_node))
+}
 
 #[repr(C)]
 struct SockaddrXdp {
@@ -330,6 +509,8 @@ struct Umem {
     len: usize,
     frame_size: usize,
     headroom: usize,
+    hugepages: bool,
+    numa_node: Option<i32>,
     free_list: Vec<u64>,
     fill: RingU64,
     comp: RingU64,
@@ -385,22 +566,15 @@ impl AfXdpDataplane {
             return Err(AfXdpError::Backend(errno_msg("socket(AF_XDP)")));
         }
 
-        let umem_base = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                umem_len,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
-                -1,
-                0,
-            )
-        };
-        if umem_base == MAP_FAILED {
-            unsafe {
-                libc::close(sock);
+        let (umem_base, umem_hugepages, umem_numa_node) = match allocate_umem(cfg, umem_len) {
+            Ok(res) => res,
+            Err(err) => {
+                unsafe {
+                    libc::close(sock);
+                }
+                return Err(err);
             }
-            return Err(AfXdpError::Backend(errno_msg("mmap(umem)")));
-        }
+        };
 
         let reg = XdpUmemReg {
             addr: umem_base as u64,
@@ -486,10 +660,12 @@ impl AfXdpDataplane {
         )?;
 
         let mut umem = Umem {
-            base: umem_base as *mut u8,
+            base: umem_base,
             len: umem_len,
             frame_size,
             headroom,
+            hugepages: umem_hugepages,
+            numa_node: umem_numa_node,
             free_list: Vec::with_capacity(frames),
             fill,
             comp,
@@ -780,6 +956,9 @@ impl AfXdpDataplane {
             rx_ring_full: stats.rx_ring_full,
             rx_fill_ring_empty: stats.rx_fill_ring_empty,
             tx_ring_empty: stats.tx_ring_empty,
+            umem_hugepages: self.umem.hugepages,
+            umem_numa_node: self.umem.numa_node,
+            umem_len: self.umem.len,
         })
     }
 
@@ -1160,6 +1339,8 @@ mod tests {
             len: 0,
             frame_size: 2048,
             headroom: 256,
+            hugepages: false,
+            numa_node: None,
             free_list: Vec::new(),
             fill: RingU64 {
                 producer: ptr::null_mut(),

@@ -10,9 +10,11 @@ pub struct DpdkConfig {
     pub mbuf_count: usize,
     pub mbuf_cache: usize,
     pub socket_id: Option<i32>,
+    pub queue_sockets: Option<Vec<i32>>,
     pub core_mask: Option<String>,
     pub mem_channels: u32,
     pub no_huge: bool,
+    pub hugepage_fallback: bool,
     pub file_prefix: Option<String>,
     pub eal_args: Vec<String>,
     pub rx_desc: u16,
@@ -67,9 +69,11 @@ impl Default for DpdkConfig {
             mbuf_count: 8192,
             mbuf_cache: 256,
             socket_id: None,
+            queue_sockets: None,
             core_mask: None,
             mem_channels: 4,
             no_huge: false,
+            hugepage_fallback: true,
             file_prefix: None,
             eal_args: Vec::new(),
             rx_desc: 1024,
@@ -106,6 +110,9 @@ pub struct DpdkStats {
     pub tx: u64,
     pub rx_dropped: u64,
     pub imissed: u64,
+    pub hugepages: bool,
+    pub mempool_socket: Option<i32>,
+    pub port_socket: Option<i32>,
 }
 
 #[cfg(any(test, all(feature = "dpdk", target_os = "linux")))]
@@ -218,9 +225,12 @@ mod linux {
     use libc::{c_char, c_int, c_uint};
     use std::cell::Cell;
     use std::ffi::CString;
+    use std::fs;
     use std::marker::PhantomData;
     use std::ptr;
     use std::sync::OnceLock;
+
+    const SOCKET_ID_ANY: c_int = -1;
 
     #[repr(C)]
     pub struct rte_mbuf {
@@ -258,23 +268,64 @@ mod linux {
         rx_desc: u16,
         tx_desc: u16,
         promisc: bool,
-        socket_id: c_int,
         mbuf_count: usize,
         mbuf_cache: usize,
+        queue_sockets: Vec<c_int>,
     }
 
     #[derive(Debug)]
     struct PortState {
         config: PortConfig,
         mempools: Vec<*mut rte_mempool>,
+        port_socket: Option<c_int>,
+        hugepages: bool,
+    }
+
+    #[derive(Debug)]
+    struct EalState {
+        args: Vec<String>,
+        hugepages: bool,
     }
 
     static PORT_STATE: OnceLock<PortState> = OnceLock::new();
+    static EAL_STATE: OnceLock<EalState> = OnceLock::new();
+
+    #[derive(Debug, Clone, Copy)]
+    struct HugepageInfo {
+        total: u64,
+        free: u64,
+        size_kb: usize,
+    }
+
+    fn hugepage_info() -> Option<HugepageInfo> {
+        let body = fs::read_to_string("/proc/meminfo").ok()?;
+        let mut total = None;
+        let mut free = None;
+        let mut size_kb = None;
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("HugePages_Total:") {
+                total = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("HugePages_Free:") {
+                free = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+                size_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            }
+        }
+        match (total, free, size_kb) {
+            (Some(total), Some(free), Some(size_kb)) => Some(HugepageInfo {
+                total,
+                free,
+                size_kb,
+            }),
+            _ => None,
+        }
+    }
 
     extern "C" {
         fn rte_eal_init(argc: c_int, argv: *mut *mut c_char) -> c_int;
         fn rte_socket_id() -> c_int;
         fn rte_eth_dev_count_avail() -> u16;
+        fn rte_eth_dev_socket_id(port_id: u16) -> c_int;
         fn rte_eth_dev_start(port_id: u16) -> c_int;
         fn rte_eth_promiscuous_enable(port_id: u16);
         fn rte_eth_rx_burst(
@@ -369,6 +420,9 @@ mod linux {
         rx_queues: u16,
         tx_queues: u16,
         mempool: *mut rte_mempool,
+        mempool_socket: Option<i32>,
+        port_socket: Option<i32>,
+        hugepages: bool,
         rx_cache: Vec<*mut rte_mbuf>,
         rx_buf: Vec<*mut rte_mbuf>,
         tx_buf: Vec<*mut rte_mbuf>,
@@ -392,7 +446,7 @@ mod linux {
             if cfg.mbuf_count == 0 {
                 return Err(DpdkError::Config("mbuf_count must be > 0".into()));
             }
-            init_eal(cfg)?;
+            let hugepages = init_eal(cfg)?;
 
             let port_id = if let Some(pid) = cfg.port_id {
                 pid
@@ -418,7 +472,7 @@ mod linux {
                 return Err(DpdkError::Config("port_id out of range".into()));
             }
 
-            let port_state = init_port(cfg, port_id)?;
+            let port_state = init_port(cfg, port_id, hugepages)?;
             let rx_queue = cfg.rx_queue.unwrap_or(0);
             let tx_queue = cfg.tx_queue.unwrap_or(rx_queue);
             if rx_queue >= port_state.config.rx_queues {
@@ -427,6 +481,13 @@ mod linux {
             if tx_queue >= port_state.config.tx_queues {
                 return Err(DpdkError::Config("tx_queue out of range".into()));
             }
+            let mempool_socket = port_state
+                .config
+                .queue_sockets
+                .get(rx_queue as usize)
+                .copied()
+                .and_then(normalize_socket_id);
+            let port_socket = port_state.port_socket.map(|v| v as i32);
             let mbuf_pool = *port_state
                 .mempools
                 .get(rx_queue as usize)
@@ -442,6 +503,9 @@ mod linux {
                 rx_queues: port_state.config.rx_queues,
                 tx_queues: port_state.config.tx_queues,
                 mempool: mbuf_pool,
+                mempool_socket,
+                port_socket,
+                hugepages: port_state.hugepages,
                 rx_cache: Vec::with_capacity(rx_burst as usize),
                 rx_buf: vec![ptr::null_mut(); rx_burst as usize],
                 tx_buf: vec![ptr::null_mut(); 1],
@@ -528,6 +592,9 @@ mod linux {
                 tx: out.tx,
                 rx_dropped: out.rx_dropped,
                 imissed: out.imissed,
+                hugepages: self.hugepages,
+                mempool_socket: self.mempool_socket,
+                port_socket: self.port_socket,
             })
         }
 
@@ -621,17 +688,17 @@ mod linux {
         }
     }
 
-    fn init_eal(cfg: &DpdkConfig) -> Result<(), DpdkError> {
-        static INIT: OnceLock<Vec<String>> = OnceLock::new();
-        if let Some(existing) = INIT.get() {
-            if existing != &build_eal_args(cfg) {
+    fn init_eal(cfg: &DpdkConfig) -> Result<bool, DpdkError> {
+        let no_huge = effective_no_huge(cfg)?;
+        let args = build_eal_args(cfg, no_huge);
+        if let Some(existing) = EAL_STATE.get() {
+            if existing.args != args {
                 return Err(DpdkError::Config(
                     "dpdk already initialized with different args".into(),
                 ));
             }
-            return Ok(());
+            return Ok(existing.hugepages);
         }
-        let args = build_eal_args(cfg);
         let mut cstrings: Vec<CString> = args
             .iter()
             .map(|s| CString::new(s.as_str()).unwrap())
@@ -644,16 +711,26 @@ mod linux {
         if rc < 0 {
             return Err(dpdk_err("rte_eal_init"));
         }
-        let _ = INIT.set(args);
-        Ok(())
+        let hugepages = !no_huge;
+        let _ = EAL_STATE.set(EalState { args, hugepages });
+        Ok(hugepages)
     }
 
-    fn init_port(cfg: &DpdkConfig, port_id: u16) -> Result<&'static PortState, DpdkError> {
-        let desired = desired_port_config(cfg, port_id)?;
+    fn init_port(
+        cfg: &DpdkConfig,
+        port_id: u16,
+        hugepages: bool,
+    ) -> Result<&'static PortState, DpdkError> {
+        let (desired, port_socket) = desired_port_config(cfg, port_id)?;
         if let Some(state) = PORT_STATE.get() {
             if state.config != desired {
                 return Err(DpdkError::Config(
                     "dpdk port already initialized with different config".into(),
+                ));
+            }
+            if state.hugepages != hugepages {
+                return Err(DpdkError::Config(
+                    "dpdk already initialized with different hugepage mode".into(),
                 ));
             }
             return Ok(state);
@@ -662,7 +739,11 @@ mod linux {
         let config = desired;
         let mut mempools = Vec::with_capacity(config.rx_queues as usize);
         for q in 0..config.rx_queues {
-            let pool = create_mempool(cfg, config.socket_id, port_id, q)?;
+            let socket_id = *config
+                .queue_sockets
+                .get(q as usize)
+                .unwrap_or(&SOCKET_ID_ANY);
+            let pool = create_mempool(cfg, socket_id, port_id, q)?;
             mempools.push(pool);
         }
 
@@ -673,8 +754,12 @@ mod linux {
 
         for q in 0..config.rx_queues {
             let pool = mempools[q as usize];
+            let socket_id = *config
+                .queue_sockets
+                .get(q as usize)
+                .unwrap_or(&SOCKET_ID_ANY);
             let rc = unsafe {
-                aegis_dpdk_rx_queue_setup(port_id, q, config.rx_desc, config.socket_id, pool)
+                aegis_dpdk_rx_queue_setup(port_id, q, config.rx_desc, socket_id, pool)
             };
             if rc < 0 {
                 return Err(dpdk_err("rx queue setup"));
@@ -682,8 +767,12 @@ mod linux {
         }
 
         for q in 0..config.tx_queues {
+            let socket_id = *config
+                .queue_sockets
+                .get(q as usize)
+                .unwrap_or(&SOCKET_ID_ANY);
             let rc = unsafe {
-                aegis_dpdk_tx_queue_setup(port_id, q, config.tx_desc, config.socket_id)
+                aegis_dpdk_tx_queue_setup(port_id, q, config.tx_desc, socket_id)
             };
             if rc < 0 {
                 return Err(dpdk_err("tx queue setup"));
@@ -698,7 +787,12 @@ mod linux {
             unsafe { rte_eth_promiscuous_enable(port_id) };
         }
 
-        let state = PortState { config, mempools };
+        let state = PortState {
+            config,
+            mempools,
+            port_socket,
+            hugepages,
+        };
         if PORT_STATE.set(state).is_err() {
             let state = PORT_STATE.get().ok_or_else(|| {
                 DpdkError::Backend("dpdk port initialization race".into())
@@ -708,11 +802,16 @@ mod linux {
                     "dpdk port already initialized with different config".into(),
                 ));
             }
+            if state.hugepages != hugepages {
+                return Err(DpdkError::Config(
+                    "dpdk already initialized with different hugepage mode".into(),
+                ));
+            }
         }
         PORT_STATE.get().ok_or_else(|| DpdkError::Backend("dpdk port init failed".into()))
     }
 
-    fn build_eal_args(cfg: &DpdkConfig) -> Vec<String> {
+    fn build_eal_args(cfg: &DpdkConfig, no_huge: bool) -> Vec<String> {
         let mut args = vec!["aegis-dpdk".to_string()];
         if let Some(mask) = &cfg.core_mask {
             if mask.starts_with("0x") {
@@ -728,7 +827,7 @@ mod linux {
         }
         args.push("-n".to_string());
         args.push(cfg.mem_channels.to_string());
-        if cfg.no_huge {
+        if no_huge && !cfg.eal_args.iter().any(|arg| arg == "--no-huge") {
             args.push("--no-huge".to_string());
         }
         if let Some(prefix) = &cfg.file_prefix {
@@ -737,6 +836,100 @@ mod linux {
         }
         args.extend(cfg.eal_args.clone());
         args
+    }
+
+    fn effective_no_huge(cfg: &DpdkConfig) -> Result<bool, DpdkError> {
+        if cfg.no_huge || cfg.eal_args.iter().any(|arg| arg == "--no-huge") {
+            return Ok(true);
+        }
+        match hugepage_info() {
+            Some(info) => {
+                if info.total == 0 || info.free == 0 {
+                    if cfg.hugepage_fallback {
+                        Ok(true)
+                    } else {
+                        Err(DpdkError::Config(format!(
+                            "hugepages unavailable (total={}, free={})",
+                            info.total, info.free
+                        )))
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            None => {
+                if cfg.hugepage_fallback {
+                    Ok(true)
+                } else {
+                    Err(DpdkError::Config(
+                        "hugepage info unavailable".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn resolve_queue_sockets(
+        cfg: &DpdkConfig,
+        port_socket: Option<c_int>,
+        max_queues: u16,
+    ) -> Result<Vec<c_int>, DpdkError> {
+        let max_queues = max_queues.max(1) as usize;
+        if let Some(socket_id) = cfg.socket_id {
+            if socket_id < SOCKET_ID_ANY {
+                return Err(DpdkError::Config(
+                    "socket_id must be >= -1".into(),
+                ));
+            }
+        }
+        let default_socket = cfg
+            .socket_id
+            .or(port_socket)
+            .unwrap_or_else(|| unsafe { rte_socket_id() });
+        let default_socket = if default_socket < 0 {
+            SOCKET_ID_ANY
+        } else {
+            default_socket
+        };
+        if let Some(list) = &cfg.queue_sockets {
+            if list.is_empty() {
+                return Err(DpdkError::Config("queue_sockets cannot be empty".into()));
+            }
+            for &socket_id in list {
+                if socket_id < SOCKET_ID_ANY {
+                    return Err(DpdkError::Config(
+                        "queue_sockets must be >= -1".into(),
+                    ));
+                }
+            }
+            if list.len() == 1 {
+                return Ok(vec![list[0]; max_queues]);
+            }
+            if list.len() != max_queues {
+                return Err(DpdkError::Config(
+                    "queue_sockets must have length 1 or match max queues".into(),
+                ));
+            }
+            return Ok(list.clone());
+        }
+        Ok(vec![default_socket; max_queues])
+    }
+
+    fn port_socket_id(port_id: u16) -> Option<c_int> {
+        let socket_id = unsafe { rte_eth_dev_socket_id(port_id) };
+        if socket_id < 0 {
+            None
+        } else {
+            Some(socket_id)
+        }
+    }
+
+    fn normalize_socket_id(socket_id: c_int) -> Option<i32> {
+        if socket_id < 0 {
+            None
+        } else {
+            Some(socket_id as i32)
+        }
     }
 
     fn create_mempool(
@@ -764,19 +957,27 @@ mod linux {
         Ok(pool)
     }
 
-    fn desired_port_config(cfg: &DpdkConfig, port_id: u16) -> Result<PortConfig, DpdkError> {
-        let socket_id = cfg.socket_id.unwrap_or_else(|| unsafe { rte_socket_id() });
-        Ok(PortConfig {
-            port_id,
-            rx_queues: cfg.rx_queues,
-            tx_queues: cfg.tx_queues,
-            rx_desc: cfg.rx_desc,
-            tx_desc: cfg.tx_desc,
-            promisc: cfg.promisc,
-            socket_id,
-            mbuf_count: cfg.mbuf_count,
-            mbuf_cache: cfg.mbuf_cache,
-        })
+    fn desired_port_config(
+        cfg: &DpdkConfig,
+        port_id: u16,
+    ) -> Result<(PortConfig, Option<c_int>), DpdkError> {
+        let port_socket = port_socket_id(port_id);
+        let max_queues = cfg.rx_queues.max(cfg.tx_queues);
+        let queue_sockets = resolve_queue_sockets(cfg, port_socket, max_queues)?;
+        Ok((
+            PortConfig {
+                port_id,
+                rx_queues: cfg.rx_queues,
+                tx_queues: cfg.tx_queues,
+                rx_desc: cfg.rx_desc,
+                tx_desc: cfg.tx_desc,
+                promisc: cfg.promisc,
+                mbuf_count: cfg.mbuf_count,
+                mbuf_cache: cfg.mbuf_cache,
+                queue_sockets,
+            },
+            port_socket,
+        ))
     }
 
     fn allocate_mbuf(pool: *mut rte_mempool, len: usize) -> Result<*mut rte_mbuf, DpdkError> {
@@ -822,6 +1023,8 @@ mod tests {
         assert_eq!(cfg.tx_queues, 1);
         assert_eq!(cfg.mem_channels, 4);
         assert!(!cfg.no_huge);
+        assert!(cfg.hugepage_fallback);
+        assert!(cfg.queue_sockets.is_none());
         assert!(cfg.promisc);
     }
 

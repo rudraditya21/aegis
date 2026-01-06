@@ -57,6 +57,11 @@ dataplane:
     frame-size: 2048
     headroom: 256
     use-need-wakeup: false
+    numa-node: 0
+    use-hugepages: true
+    hugepage-size-kb: 2048
+    hugepage-fallback: true
+    numa-fallback: true
     pin-dir: "/sys/fs/bpf/aegis"
     program-name: "xdp_prog_eth0"
     map-name: "xsk_map_eth0"
@@ -80,8 +85,11 @@ dataplane:
     tx-queues: 1
     mbuf-count: 8192
     mbuf-cache: 256
+    socket-id: 0
+    queue-sockets: [0]
     mem-channels: 4
     no-huge: false
+    hugepage-fallback: true
     core-mask: "0"
     rx-desc: 1024
     tx-desc: 1024
