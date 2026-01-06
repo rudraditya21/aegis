@@ -153,6 +153,7 @@ AF_XDP (Linux only):
 - Optional bundled XDP program pinning uses `pin-dir`, `program-name`, and `map-name`.
 - UMEM tuning: `umem-frames`, `frame-size`, `headroom`.
 - Hugepages/NUMA: `use-hugepages`, `hugepage-size-kb`, `numa-node`, and `*-fallback` flags.
+- RSS tuning uses ethtool rxfh (key + indirection); requires NIC support and does not expose hash-field selection.
 
 DPDK (Linux only):
 - Requires DPDK userspace drivers (vfio/uio), hugepages (or `no-huge=true`), and port binding.

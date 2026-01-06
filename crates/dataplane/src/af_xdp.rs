@@ -4,7 +4,8 @@ use crate::{
 };
 
 pub use aegis_af_xdp::{
-    AfXdpDataplane, AfXdpFrame, AfXdpTxLease, XdpAttachFlags, XdpAttachMode,
+    AfXdpDataplane, AfXdpFrame, AfXdpRssConfig, AfXdpRssHashField, AfXdpTxLease, XdpAttachFlags,
+    XdpAttachMode,
 };
 
 impl FrameView for AfXdpFrame<'_> {
@@ -43,20 +44,39 @@ impl Dataplane for AfXdpDataplane {
         })
     }
 
-    fn configure_rss(&mut self, _rss: &RssConfig) -> Result<(), DataplaneError> {
-        Err(DataplaneError::Unsupported(
-            "af-xdp rss requires driver configuration",
-        ))
+    fn configure_rss(&mut self, rss: &RssConfig) -> Result<(), DataplaneError> {
+        let cfg = AfXdpRssConfig {
+            enabled: rss.enabled,
+            symmetric: rss.symmetric,
+            hash_fields: rss
+                .hash_fields
+                .iter()
+                .copied()
+                .map(map_hash_field)
+                .collect(),
+            seed: rss.seed,
+            queues: rss.queues.clone(),
+        };
+        AfXdpDataplane::configure_rss(self, &cfg).map_err(map_err)
     }
 
     fn capabilities(&self) -> DataplaneCapabilities {
         DataplaneCapabilities {
             supports_zero_copy_rx: true,
             supports_zero_copy_tx: true,
-            supports_rss: false,
+            supports_rss: true,
             supports_tx: true,
             supports_filters: false,
         }
+    }
+}
+
+fn map_hash_field(field: crate::RssHashField) -> AfXdpRssHashField {
+    match field {
+        crate::RssHashField::Ipv4 => AfXdpRssHashField::Ipv4,
+        crate::RssHashField::Ipv6 => AfXdpRssHashField::Ipv6,
+        crate::RssHashField::Tcp => AfXdpRssHashField::Tcp,
+        crate::RssHashField::Udp => AfXdpRssHashField::Udp,
     }
 }
 

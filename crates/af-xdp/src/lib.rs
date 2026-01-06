@@ -14,6 +14,40 @@ pub struct AfXdpConfig {
     pub numa_fallback: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfXdpRssHashField {
+    Ipv4,
+    Ipv6,
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone)]
+pub struct AfXdpRssConfig {
+    pub enabled: bool,
+    pub symmetric: bool,
+    pub hash_fields: Vec<AfXdpRssHashField>,
+    pub seed: Option<u64>,
+    pub queues: Option<Vec<u16>>,
+}
+
+impl Default for AfXdpRssConfig {
+    fn default() -> Self {
+        AfXdpRssConfig {
+            enabled: true,
+            symmetric: false,
+            hash_fields: vec![
+                AfXdpRssHashField::Ipv4,
+                AfXdpRssHashField::Ipv6,
+                AfXdpRssHashField::Tcp,
+                AfXdpRssHashField::Udp,
+            ],
+            seed: None,
+            queues: None,
+        }
+    }
+}
+
 impl Default for AfXdpConfig {
     fn default() -> Self {
         AfXdpConfig {
@@ -71,7 +105,7 @@ pub struct PinnedXdp {
 
 #[cfg(not(target_os = "linux"))]
 mod stub {
-    use super::{AfXdpConfig, AfXdpError, PinnedXdp};
+    use super::{AfXdpConfig, AfXdpError, AfXdpRssConfig, PinnedXdp};
 
     #[derive(Debug)]
     pub struct AfXdpDataplane;
@@ -143,6 +177,10 @@ mod stub {
             Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
         }
 
+        pub fn configure_rss(&mut self, _cfg: &AfXdpRssConfig) -> Result<(), AfXdpError> {
+            Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
+        }
+
         pub fn stats(&mut self) -> Result<super::AfXdpStats, AfXdpError> {
             Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
         }
@@ -174,11 +212,11 @@ pub use stub::{
 
 #[cfg(target_os = "linux")]
 mod linux {
-use super::{AfXdpConfig, AfXdpError, AfXdpStats, PinnedXdp};
+use super::{AfXdpConfig, AfXdpError, AfXdpRssConfig, AfXdpRssHashField, AfXdpStats, PinnedXdp};
 use libc::{
-    c_int, c_ulong, c_void, pollfd, sockaddr, socklen_t, AF_NETLINK, AF_XDP,
+    c_char, c_int, c_ulong, c_void, pollfd, sockaddr, socklen_t, AF_INET, AF_NETLINK, AF_XDP,
     MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MSG_DONTWAIT,
-    NETLINK_ROUTE, POLLIN, PROT_READ, PROT_WRITE, SOCK_RAW,
+    NETLINK_ROUTE, POLLIN, PROT_READ, PROT_WRITE, SOCK_DGRAM, SOCK_RAW,
 };
 use std::ffi::CString;
 use std::mem::{self, size_of};
@@ -207,6 +245,11 @@ const XDP_RING_NEED_WAKEUP: u32 = 1;
 const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
 const XDP_FLAGS_DRV_MODE: u32 = 1 << 2;
 const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1 << 0;
+
+const SIOCETHTOOL: c_ulong = 0x8946;
+const ETHTOOL_GRXFH: u32 = 0x0000_0029;
+const ETHTOOL_SRXFH: u32 = 0x0000_002a;
+const ETH_RSS_HASH_TOP: u32 = 1;
 
 const BPF_OBJ_GET: u32 = 7;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;
@@ -430,6 +473,24 @@ struct NlAttr {
 }
 
 #[repr(C)]
+struct EthtoolRxfh {
+    cmd: u32,
+    rss_context: u32,
+    indir_size: u32,
+    key_size: u32,
+    hfunc: u32,
+    rsvd: [u8; 4],
+}
+
+#[derive(Debug, Clone)]
+struct RxfhInfo {
+    indir_size: u32,
+    key_size: u32,
+    hfunc: u32,
+    key: Vec<u8>,
+}
+
+#[repr(C)]
 struct XdpUmemReg {
     addr: u64,
     len: u64,
@@ -585,6 +646,7 @@ pub struct AfXdpDataplane {
     tx: RingDesc,
     ifindex: u32,
     queue_id: u32,
+    ifname: String,
     need_wakeup: bool,
     last_rx_addr: Option<u64>,
     rx_count: u64,
@@ -761,6 +823,7 @@ impl AfXdpDataplane {
             tx,
             ifindex,
             queue_id,
+            ifname: iface.to_string(),
             need_wakeup: cfg.use_need_wakeup,
             last_rx_addr: None,
             rx_count: 0,
@@ -962,6 +1025,19 @@ impl AfXdpDataplane {
         lease.commit(frame.data.len())
     }
 
+    pub fn configure_rss(&mut self, cfg: &AfXdpRssConfig) -> Result<(), AfXdpError> {
+        if !cfg.enabled {
+            return Ok(());
+        }
+        if cfg.symmetric {
+            return Err(AfXdpError::Config(
+                "symmetric RSS is not configurable via ethtool".into(),
+            ));
+        }
+        validate_hash_fields(&cfg.hash_fields)?;
+        configure_rss_ethtool(&self.ifname, self.queue_id, cfg)
+    }
+
     pub fn stats(&mut self) -> Result<AfXdpStats, AfXdpError> {
         let mut stats = XdpStatistics {
             rx_dropped: 0,
@@ -1038,6 +1114,207 @@ impl Umem {
         fence(Ordering::Release);
         Ok(())
     }
+}
+
+fn validate_hash_fields(fields: &[AfXdpRssHashField]) -> Result<(), AfXdpError> {
+    if fields.is_empty() {
+        return Err(AfXdpError::Config("rss hash fields cannot be empty".into()));
+    }
+    let mut mask = 0u8;
+    for field in fields {
+        mask |= match field {
+            AfXdpRssHashField::Ipv4 => 1 << 0,
+            AfXdpRssHashField::Ipv6 => 1 << 1,
+            AfXdpRssHashField::Tcp => 1 << 2,
+            AfXdpRssHashField::Udp => 1 << 3,
+        };
+    }
+    let full = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+    if mask != full {
+        return Err(AfXdpError::Config(
+            "rss hash field selection is not configurable via ethtool".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn configure_rss_ethtool(
+    iface: &str,
+    default_queue: u32,
+    cfg: &AfXdpRssConfig,
+) -> Result<(), AfXdpError> {
+    let sock = unsafe { libc::socket(AF_INET, SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(AfXdpError::Backend(errno_msg("socket(AF_INET)")));
+    }
+    let res = (|| {
+        let info = query_rxfh_info(sock, iface)?;
+        if info.indir_size == 0 || info.key_size == 0 {
+            return Err(AfXdpError::Backend(
+                "rss not supported by nic (missing key or indir size)".into(),
+            ));
+        }
+        let queues: Vec<u32> = match cfg.queues.as_ref() {
+            Some(list) if !list.is_empty() => list.iter().map(|q| *q as u32).collect(),
+            _ => vec![default_queue],
+        };
+        if queues.is_empty() {
+            return Err(AfXdpError::Config("rss queues cannot be empty".into()));
+        }
+
+        let key = match cfg.seed {
+            Some(seed) => build_rss_key(Some(seed), info.key_size as usize),
+            None => info.key.clone(),
+        };
+        if key.len() != info.key_size as usize {
+            return Err(AfXdpError::Backend("rss key size mismatch".into()));
+        }
+
+        let total_len = size_of::<EthtoolRxfh>()
+            + (info.indir_size as usize * size_of::<u32>())
+            + info.key_size as usize;
+        let mut buf = vec![0u64; (total_len + 7) / 8];
+        let buf_ptr = buf.as_mut_ptr() as *mut u8;
+        let rxfh = buf_ptr as *mut EthtoolRxfh;
+        unsafe {
+            (*rxfh).cmd = ETHTOOL_SRXFH;
+            (*rxfh).rss_context = 0;
+            (*rxfh).indir_size = info.indir_size;
+            (*rxfh).key_size = info.key_size;
+            (*rxfh).hfunc = if info.hfunc == 0 { ETH_RSS_HASH_TOP } else { info.hfunc };
+        }
+
+        let indir_ptr = unsafe { (rxfh as *mut u8).add(size_of::<EthtoolRxfh>()) as *mut u32 };
+        for i in 0..info.indir_size as usize {
+            let queue = queues[i % queues.len()];
+            unsafe {
+                ptr::write(indir_ptr.add(i), queue);
+            }
+        }
+        let key_ptr = unsafe {
+            (indir_ptr as *mut u8).add(info.indir_size as usize * size_of::<u32>())
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(key.as_ptr(), key_ptr, key.len());
+        }
+
+        ethtool_ioctl(sock, iface, rxfh as *mut c_void, "rss configure", true)
+    })();
+    unsafe {
+        libc::close(sock);
+    }
+    res
+}
+
+fn query_rxfh_info(sock: RawFd, iface: &str) -> Result<RxfhInfo, AfXdpError> {
+    let mut info = EthtoolRxfh {
+        cmd: ETHTOOL_GRXFH,
+        rss_context: 0,
+        indir_size: 0,
+        key_size: 0,
+        hfunc: 0,
+        rsvd: [0; 4],
+    };
+    ethtool_ioctl(sock, iface, &mut info as *mut _ as *mut c_void, "rss query", false)?;
+    if info.indir_size == 0 || info.key_size == 0 {
+        return Err(AfXdpError::Backend(
+            "rss not supported by nic (zero sizes)".into(),
+        ));
+    }
+
+    let total_len = size_of::<EthtoolRxfh>()
+        + (info.indir_size as usize * size_of::<u32>())
+        + info.key_size as usize;
+    let mut buf = vec![0u64; (total_len + 7) / 8];
+    let buf_ptr = buf.as_mut_ptr() as *mut u8;
+    let rxfh = buf_ptr as *mut EthtoolRxfh;
+    unsafe {
+        (*rxfh).cmd = ETHTOOL_GRXFH;
+        (*rxfh).rss_context = 0;
+        (*rxfh).indir_size = info.indir_size;
+        (*rxfh).key_size = info.key_size;
+    }
+    ethtool_ioctl(sock, iface, rxfh as *mut c_void, "rss query", false)?;
+    let hfunc = unsafe { (*rxfh).hfunc };
+    let key_ptr = unsafe {
+        (rxfh as *const u8)
+            .add(size_of::<EthtoolRxfh>() + info.indir_size as usize * size_of::<u32>())
+    };
+    let key = unsafe { slice::from_raw_parts(key_ptr, info.key_size as usize) };
+    Ok(RxfhInfo {
+        indir_size: info.indir_size,
+        key_size: info.key_size,
+        hfunc,
+        key: key.to_vec(),
+    })
+}
+
+fn ethtool_ioctl(
+    sock: RawFd,
+    iface: &str,
+    data: *mut c_void,
+    ctx: &str,
+    is_set: bool,
+) -> Result<(), AfXdpError> {
+    let mut ifr = ifreq_for_iface(iface, data)?;
+    let rc = unsafe { libc::ioctl(sock, SIOCETHTOOL, &mut ifr) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+        if raw == libc::EOPNOTSUPP || raw == libc::ENOTTY {
+            return Err(AfXdpError::Backend(format!(
+                "{ctx}: rss not supported by nic ({err})"
+            )));
+        }
+        if is_set && raw == libc::EINVAL {
+            return Err(AfXdpError::Config(format!(
+                "{ctx}: rss parameters rejected by driver ({err})"
+            )));
+        }
+        return Err(AfXdpError::Backend(format!("{ctx}: {err}")));
+    }
+    Ok(())
+}
+
+fn ifreq_for_iface(iface: &str, data: *mut c_void) -> Result<libc::ifreq, AfXdpError> {
+    let name_bytes = iface.as_bytes();
+    if name_bytes.is_empty() {
+        return Err(AfXdpError::Config("iface cannot be empty".into()));
+    }
+    if name_bytes.len() >= libc::IFNAMSIZ as usize {
+        return Err(AfXdpError::Config("iface name too long".into()));
+    }
+    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes.iter()) {
+        *dst = *src as c_char;
+    }
+    unsafe {
+        ifr.ifr_ifru.ifru_data = data as *mut c_char;
+    }
+    Ok(ifr)
+}
+
+fn build_rss_key(seed: Option<u64>, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut state = seed.unwrap_or(0x6a09e667f3bcc909);
+    while out.len() < len {
+        state = splitmix64(state);
+        for byte in state.to_le_bytes() {
+            if out.len() == len {
+                break;
+            }
+            out.push(byte);
+        }
+    }
+    out
+}
+
+fn splitmix64(mut state: u64) -> u64 {
+    state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
 impl AfXdpTxLease<'_> {
