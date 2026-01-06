@@ -27,7 +27,7 @@ use utils::{
 mod runtime_config;
 use runtime_config::load_runtime_config;
 mod packet_ref;
-use packet_ref::{FrameRef, PacketRef};
+use packet_ref::{FrameRef, PacketRef, SharedFrame};
 mod rss;
 use rss::FlowSharder;
 
@@ -1307,6 +1307,11 @@ fn run_capture_software_sharded(
     disable_geo: bool,
     disable_time: bool,
 ) -> Result<CaptureSummary, String> {
+    enum WorkItem {
+        Frame(SharedFrame),
+        Meta(PacketMetadata),
+    }
+
     let rss = dp_cfg
         .rss
         .as_ref()
@@ -1319,8 +1324,9 @@ fn run_capture_software_sharded(
     let audit_log = audit_log.map(|s| s.to_string());
     let tuning = tuning.clone();
 
+    let capture_payload = !disable_ids || !disable_ips;
     for worker_index in 0..workers {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WorkItem>(1024);
         senders.push(tx);
         let core_id = resolve_worker_core(Some(rss), worker_index, workers)?;
         let worker_id = worker_index;
@@ -1345,14 +1351,21 @@ fn run_capture_software_sharded(
             )?;
             let capture_payload = capture_payload_enabled(&mgr);
             let mut local_processed = 0usize;
-            for data in rx {
-                if let Ok(meta) = packet_metadata(&data, Direction::Ingress, capture_payload) {
-                    let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
-                    if let Some(path) = &audit_log {
-                        let _ = write_audit(path, &meta, &eval);
+            for item in rx {
+                let meta = match item {
+                    WorkItem::Meta(meta) => meta,
+                    WorkItem::Frame(frame) => {
+                        match packet_metadata(frame.bytes(), Direction::Ingress, capture_payload) {
+                            Ok(meta) => meta,
+                            Err(_) => continue,
+                        }
                     }
-                    local_processed = local_processed.saturating_add(1);
+                };
+                let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
+                if let Some(path) = &audit_log {
+                    let _ = write_audit(path, &meta, &eval);
                 }
+                local_processed = local_processed.saturating_add(1);
             }
             Ok(summarize_manager(&mgr, worker_id, local_processed))
         });
@@ -1366,9 +1379,20 @@ fn run_capture_software_sharded(
     while processed < count {
         match dataplane.next_frame() {
             Ok(Some(pkt)) => {
-                let bytes = pkt.bytes().to_vec();
-                let idx = sharder.select_queue(&bytes);
-                if senders[idx].send(bytes).is_err() {
+                let bytes = pkt.bytes();
+                let idx = sharder.select_queue(bytes);
+                let item = if capture_payload {
+                    WorkItem::Frame(SharedFrame::from_view(&pkt))
+                } else {
+                    match packet_metadata(bytes, Direction::Ingress, false) {
+                        Ok(meta) => WorkItem::Meta(meta),
+                        Err(_) => {
+                            processed += 1;
+                            continue;
+                        }
+                    }
+                };
+                if senders[idx].send(item).is_err() {
                     error = Some("worker channel closed".into());
                     break;
                 }

@@ -5,6 +5,8 @@ use packet_parser::{
     parse_tcp_segment, parse_udp_datagram,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::time::SystemTime;
 #[derive(Debug, Clone, Copy)]
 pub struct FrameRef<'a> {
     bytes: &'a [u8],
@@ -19,6 +21,39 @@ impl<'a> FrameRef<'a> {
 
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedFrame {
+    bytes: Arc<[u8]>,
+    timestamp: Option<SystemTime>,
+}
+
+impl SharedFrame {
+    pub fn from_view<F: FrameView + ?Sized>(frame: &F) -> Self {
+        SharedFrame {
+            bytes: Arc::from(frame.bytes()),
+            timestamp: frame.timestamp(),
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn timestamp(&self) -> Option<SystemTime> {
+        self.timestamp
+    }
+}
+
+impl FrameView for SharedFrame {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn timestamp(&self) -> Option<SystemTime> {
+        self.timestamp
     }
 }
 
@@ -209,6 +244,7 @@ mod tests {
 
     struct DummyFrame<'a> {
         data: &'a [u8],
+        timestamp: Option<std::time::SystemTime>,
     }
 
     impl FrameView for DummyFrame<'_> {
@@ -217,7 +253,7 @@ mod tests {
         }
 
         fn timestamp(&self) -> Option<std::time::SystemTime> {
-            None
+            self.timestamp
         }
     }
 
@@ -325,8 +361,24 @@ mod tests {
     #[test]
     fn frameref_from_view() {
         let data = [1u8, 2, 3, 4];
-        let frame = DummyFrame { data: &data };
+        let frame = DummyFrame {
+            data: &data,
+            timestamp: None,
+        };
         let view = FrameRef::from_view(&frame);
         assert_eq!(view.bytes(), &data);
+    }
+
+    #[test]
+    fn shared_frame_from_view() {
+        let data = [9u8, 8, 7, 6];
+        let ts = std::time::SystemTime::UNIX_EPOCH;
+        let frame = DummyFrame {
+            data: &data,
+            timestamp: Some(ts),
+        };
+        let shared = SharedFrame::from_view(&frame);
+        assert_eq!(shared.bytes(), &data);
+        assert_eq!(shared.timestamp(), Some(ts));
     }
 }
