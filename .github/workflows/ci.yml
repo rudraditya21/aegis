@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [pcap, af-xdp, dpdk]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install base deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev pkg-config
+
+      - name: Install DPDK deps
+        if: matrix.features == 'dpdk'
+        run: |
+          sudo apt-get install -y libdpdk-dev
+
+      - name: Rust tests (core)
+        run: cargo test -p aegis-core
+
+      - name: Rust tests (dataplane)
+        run: cargo test -p aegis-dataplane --features ${{ matrix.features }}
+
+      - name: Rust tests (aegis)
+        run: cargo test -p aegis --features ${{ matrix.features }}
+
+      - name: Rust tests (af-xdp)
+        if: matrix.features == 'af-xdp'
+        run: cargo test -p aegis-af-xdp
+
+      - name: Rust tests (dpdk)
+        if: matrix.features == 'dpdk'
+        run: cargo test -p aegis-dpdk --features dpdk

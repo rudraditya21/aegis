@@ -38,3 +38,6 @@ cargo run -p aegis -- metrics --rules "$RULES_FILE"
 
 echo "Running dataplane diagnostics..."
 cargo run -p aegis -- dataplane-diag
+
+echo "Checking RSS balance..."
+cargo run -p aegis -- rss-balance --flows 1000 --workers 4 --protocol tcp

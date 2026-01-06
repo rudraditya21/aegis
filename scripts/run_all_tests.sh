@@ -35,5 +35,8 @@ done
 echo "[all] Running feature matrix..."
 bash scripts/run_feature_matrix.sh
 
+echo "[all] Running RSS balance benchmark..."
+bash scripts/run_rss_balance.sh
+
 echo "[all] (Optional) Perf/stress tests: run scripts/run_perf_stress.sh manually if needed."
 echo "[all] Complete."

@@ -58,6 +58,8 @@ impl Default for Tuning {
 
 #[derive(Debug)]
 struct WorkerSummary {
+    worker_id: usize,
+    processed: usize,
     counters: FirewallCounters,
     flow_stats: FlowStats,
     flows: Vec<FlowSnapshot>,
@@ -70,6 +72,7 @@ struct WorkerSummary {
 #[derive(Debug)]
 struct CaptureSummary {
     processed: usize,
+    worker_stats: Vec<(usize, usize)>,
     counters: FirewallCounters,
     flow_stats: FlowStats,
     flows: Vec<FlowSnapshot>,
@@ -113,6 +116,7 @@ fn main() {
         }
         "capture-async" => cmd_capture_async(args.collect()),
         "replay" => cmd_replay(args.collect()),
+        "rss-balance" => cmd_rss_balance(args.collect()),
         "dataplane-diag" => cmd_dataplane_diag(args.collect()),
         _ => Err(format!("Unknown command: {}", cmd)),
     };
@@ -569,6 +573,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     let mut policies_path: Option<String> = None;
     let mut iface: Option<String> = None;
     let mut count: usize = 10;
+    let mut worker_stats = false;
     let mut disable_logs = false;
     let mut disable_ids = false;
     let mut disable_ips = false;
@@ -587,6 +592,7 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
                     count = c.parse().map_err(|_| "invalid count".to_string())?;
                 }
             }
+            "--worker-stats" => worker_stats = true,
             "--no-logs" => disable_logs = true,
             "--disable-ids" => disable_ids = true,
             "--disable-ips" => disable_ips = true,
@@ -704,6 +710,31 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
     let rule_hits = summary.rule_hits;
     if !rule_hits.is_empty() {
         println!("Rule hit counters: {:?}", rule_hits);
+    }
+    if worker_stats && !summary.worker_stats.is_empty() {
+        let mut min = usize::MAX;
+        let mut max = 0usize;
+        let mut sum = 0usize;
+        for (worker, processed) in &summary.worker_stats {
+            println!("Worker {worker} processed={processed}");
+            min = min.min(*processed);
+            max = max.max(*processed);
+            sum = sum.saturating_add(*processed);
+        }
+        let avg = if summary.worker_stats.is_empty() {
+            0.0
+        } else {
+            sum as f64 / summary.worker_stats.len() as f64
+        };
+        let skew = if avg > 0.0 {
+            (max.saturating_sub(min)) as f64 / avg
+        } else {
+            0.0
+        };
+        println!(
+            "Worker balance min={} max={} avg={:.2} skew={:.2}",
+            min, max, avg, skew
+        );
     }
     Ok(())
 }
@@ -828,8 +859,10 @@ fn build_manager(
     Ok(mgr)
 }
 
-fn summarize_manager(mgr: &FirewallManager) -> WorkerSummary {
+fn summarize_manager(mgr: &FirewallManager, worker_id: usize, processed: usize) -> WorkerSummary {
     WorkerSummary {
+        worker_id,
+        processed,
         counters: mgr.counters(),
         flow_stats: mgr.flow_stats(),
         flows: mgr.flows(),
@@ -841,8 +874,14 @@ fn summarize_manager(mgr: &FirewallManager) -> WorkerSummary {
 }
 
 fn merge_worker_summaries(results: Vec<WorkerSummary>, processed: usize) -> CaptureSummary {
+    let mut worker_stats: Vec<(usize, usize)> = results
+        .iter()
+        .map(|r| (r.worker_id, r.processed))
+        .collect();
+    worker_stats.sort_by_key(|(id, _)| *id);
     let mut summary = CaptureSummary {
         processed,
+        worker_stats,
         counters: FirewallCounters::default(),
         flow_stats: FlowStats::default(),
         flows: Vec::new(),
@@ -1124,7 +1163,7 @@ fn run_capture_single(
             Err(e) => return Err(format!("dataplane read: {e}")),
         }
     }
-    let summary = summarize_manager(&mgr);
+    let summary = summarize_manager(&mgr, 0, processed);
     Ok(merge_worker_summaries(vec![summary], processed))
 }
 
@@ -1155,6 +1194,7 @@ fn run_capture_per_queue(
     let worker_count = queues.len();
     for (worker_index, queue) in queues.into_iter().enumerate() {
         let core_id = resolve_worker_core(rss, worker_index, worker_count)?;
+        let worker_id = worker_index;
         let iface = iface.to_string();
         let rules_path = rules_path.clone();
         let policies_path = policies_path.clone();
@@ -1178,6 +1218,7 @@ fn run_capture_per_queue(
                 disable_time,
             )?;
             let capture_payload = capture_payload_enabled(&mgr);
+            let mut local_processed = 0usize;
             let mut dataplane =
                 DataplaneHandle::open_live(&iface, &dp_cfg).map_err(|e| format!("dataplane: {e}"))?;
             if let Some(rss) = dp_cfg.rss.as_ref() {
@@ -1212,6 +1253,7 @@ fn run_capture_per_queue(
                             if let Some(path) = &audit_log {
                                 let _ = write_audit(path, &meta, &eval);
                             }
+                            local_processed = local_processed.saturating_add(1);
                         }
                     }
                     Ok(None) => continue,
@@ -1221,7 +1263,7 @@ fn run_capture_per_queue(
                     }
                 }
             }
-            Ok(summarize_manager(&mgr))
+            Ok(summarize_manager(&mgr, worker_id, local_processed))
         });
         handles.push(handle);
     }
@@ -1281,6 +1323,7 @@ fn run_capture_software_sharded(
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
         senders.push(tx);
         let core_id = resolve_worker_core(Some(rss), worker_index, workers)?;
+        let worker_id = worker_index;
         let rules_path = rules_path.clone();
         let policies_path = policies_path.clone();
         let audit_log = audit_log.clone();
@@ -1301,15 +1344,17 @@ fn run_capture_software_sharded(
                 disable_time,
             )?;
             let capture_payload = capture_payload_enabled(&mgr);
+            let mut local_processed = 0usize;
             for data in rx {
                 if let Ok(meta) = packet_metadata(&data, Direction::Ingress, capture_payload) {
                     let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
                     if let Some(path) = &audit_log {
                         let _ = write_audit(path, &meta, &eval);
                     }
+                    local_processed = local_processed.saturating_add(1);
                 }
             }
-            Ok(summarize_manager(&mgr))
+            Ok(summarize_manager(&mgr, worker_id, local_processed))
         });
         handles.push(handle);
     }
@@ -1566,7 +1611,11 @@ fn cmd_metrics(args: Vec<String>) -> Result<(), String> {
         "Flow stats packets={} new_flows={} evicted={}",
         stats.packets, stats.new_flows, stats.evicted
     );
-    println!("Flow capacity={}", mgr.flow_capacity());
+    println!(
+        "Flow capacity={} shards={}",
+        mgr.flow_capacity(),
+        mgr.flow_shard_count()
+    );
     println!(
         "IDS enabled={} IPS enabled={} Failover enabled={}",
         mgr.ids_enabled(),
@@ -1597,12 +1646,21 @@ fn print_dataplane_metrics(iface: Option<&str>) -> Result<(), String> {
     };
     let mut dp =
         DataplaneHandle::open_live(iface, &dp_cfg).map_err(|e| format!("open dataplane: {e}"))?;
+    let caps = dp.capabilities();
     let stats = dp
         .stats()
         .map_err(|e| format!("dataplane stats: {e}"))?;
     println!(
         "Dataplane stats received={} dropped={} if_dropped={} tx={}",
         stats.received, stats.dropped, stats.if_dropped, stats.transmitted
+    );
+    println!(
+        "Dataplane caps zero_copy_rx={} zero_copy_tx={} rss={} tx={} filters={}",
+        caps.supports_zero_copy_rx,
+        caps.supports_zero_copy_tx,
+        caps.supports_rss,
+        caps.supports_tx,
+        caps.supports_filters
     );
     match &mut dp {
         #[cfg(all(feature = "af-xdp", target_os = "linux"))]
@@ -1627,6 +1685,283 @@ fn print_dataplane_metrics(iface: Option<&str>) -> Result<(), String> {
         DataplaneHandle::Pcap(_) => {}
     }
     Ok(())
+}
+
+fn cmd_rss_balance(args: Vec<String>) -> Result<(), String> {
+    let mut flows: usize = 100_000;
+    let mut workers: Option<usize> = None;
+    let mut protocol = IpProtocol::Tcp;
+    let mut seed: Option<u64> = None;
+    let mut symmetric: Option<bool> = None;
+    let mut ipv6 = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--flows" => {
+                flows = iter
+                    .next()
+                    .ok_or("Missing --flows <count>")?
+                    .parse()
+                    .map_err(|_| "invalid flows".to_string())?;
+            }
+            "--workers" => {
+                workers = Some(
+                    iter.next()
+                        .ok_or("Missing --workers <count>")?
+                        .parse()
+                        .map_err(|_| "invalid workers".to_string())?,
+                );
+            }
+            "--protocol" => {
+                let proto = iter.next().ok_or("Missing --protocol <tcp|udp>")?;
+                protocol = parse_rss_protocol(proto)?;
+            }
+            "--seed" => {
+                seed = Some(
+                    iter.next()
+                        .ok_or("Missing --seed <number>")?
+                        .parse()
+                        .map_err(|_| "invalid seed".to_string())?,
+                );
+            }
+            "--symmetric" => symmetric = Some(true),
+            "--no-symmetric" => symmetric = Some(false),
+            "--ipv6" => ipv6 = true,
+            "--ipv4" => ipv6 = false,
+            other => return Err(format!("Unknown flag {other}")),
+        }
+    }
+
+    if flows == 0 {
+        return Err("flows must be > 0".into());
+    }
+    let runtime = load_runtime_config(&config_root())?;
+    let mut rss = runtime.dataplane.rss.unwrap_or_default();
+    if let Some(seed) = seed {
+        rss.seed = Some(seed);
+    }
+    if let Some(sym) = symmetric {
+        rss.symmetric = sym;
+    }
+
+    let worker_count = workers.unwrap_or_else(|| {
+        if let Some(queues) = rss.queues.as_ref() {
+            queues.len().max(1)
+        } else if let Some(affinity) = rss.cpu_affinity.as_ref() {
+            affinity.len().max(1)
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        }
+    });
+    if worker_count == 0 {
+        return Err("workers must be > 0".into());
+    }
+
+    let mut counts = vec![0usize; worker_count];
+    let mut rng = SimpleRng::new(seed.unwrap_or(0x9e3779b97f4a7c15) ^ flows as u64);
+    let sharder = FlowSharder::new(&rss, worker_count);
+    for _ in 0..flows {
+        let src_port = rng.next_port();
+        let dst_port = rng.next_port();
+        let bytes = if ipv6 {
+            let src_ip = rng.next_ipv6();
+            let dst_ip = rng.next_ipv6();
+            build_ipv6_packet(src_ip, dst_ip, protocol, src_port, dst_port)
+        } else {
+            let src_ip = rng.next_ipv4();
+            let dst_ip = rng.next_ipv4();
+            build_ipv4_packet(src_ip, dst_ip, protocol, src_port, dst_port)
+        };
+        let idx = sharder.select_queue(&bytes);
+        counts[idx] = counts[idx].saturating_add(1);
+    }
+
+    let mut min = usize::MAX;
+    let mut max = 0usize;
+    let mut sum = 0usize;
+    for (idx, count) in counts.iter().enumerate() {
+        println!("worker {idx} count={count}");
+        min = min.min(*count);
+        max = max.max(*count);
+        sum = sum.saturating_add(*count);
+    }
+    let avg = sum as f64 / worker_count as f64;
+    let skew = if avg > 0.0 {
+        (max.saturating_sub(min)) as f64 / avg
+    } else {
+        0.0
+    };
+    println!(
+        "rss balance: flows={} workers={} min={} max={} avg={:.2} skew={:.2}",
+        flows, worker_count, min, max, avg, skew
+    );
+    Ok(())
+}
+
+fn parse_rss_protocol(s: &str) -> Result<IpProtocol, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(IpProtocol::Tcp),
+        "udp" => Ok(IpProtocol::Udp),
+        other => Err(format!("unsupported protocol {other}")),
+    }
+}
+
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        SimpleRng { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        (z ^ (z >> 31)) as u32
+    }
+
+    fn next_ipv4(&mut self) -> [u8; 4] {
+        let v = self.next_u32();
+        [10, (v >> 16) as u8, (v >> 8) as u8, v as u8]
+    }
+
+    fn next_ipv6(&mut self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0] = 0x20;
+        out[1] = 0x01;
+        out[2] = 0x0d;
+        out[3] = 0xb8;
+        for idx in (4..16).step_by(4) {
+            let v = self.next_u32();
+            out[idx] = (v >> 24) as u8;
+            out[idx + 1] = (v >> 16) as u8;
+            out[idx + 2] = (v >> 8) as u8;
+            out[idx + 3] = v as u8;
+        }
+        out
+    }
+
+    fn next_port(&mut self) -> u16 {
+        let v = self.next_u32();
+        let port = 1024 + (v % (u16::MAX as u32 - 1024));
+        port as u16
+    }
+}
+
+fn build_ipv4_packet(
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: IpProtocol,
+    src_port: u16,
+    dst_port: u16,
+) -> Vec<u8> {
+    let l4_len = match proto {
+        IpProtocol::Tcp => 20usize,
+        IpProtocol::Udp => 8usize,
+        _ => 8usize,
+    };
+    let total_len = 20 + l4_len;
+    let mut buf = Vec::with_capacity(14 + total_len);
+    buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    buf.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    buf.extend_from_slice(&0x0800u16.to_be_bytes());
+    buf.push(0x45);
+    buf.push(0x00);
+    buf.extend_from_slice(&(total_len as u16).to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.push(64);
+    buf.push(ip_proto_num(proto));
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&src);
+    buf.extend_from_slice(&dst);
+    match proto {
+        IpProtocol::Tcp => {
+            buf.extend_from_slice(&src_port.to_be_bytes());
+            buf.extend_from_slice(&dst_port.to_be_bytes());
+            buf.extend_from_slice(&1u32.to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf.push(0x50);
+            buf.push(0x10);
+            buf.extend_from_slice(&65535u16.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+        }
+        IpProtocol::Udp => {
+            buf.extend_from_slice(&src_port.to_be_bytes());
+            buf.extend_from_slice(&dst_port.to_be_bytes());
+            buf.extend_from_slice(&(l4_len as u16).to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+        }
+        _ => {
+            buf.extend_from_slice(&[0u8; 8]);
+        }
+    }
+    buf
+}
+
+fn build_ipv6_packet(
+    src: [u8; 16],
+    dst: [u8; 16],
+    proto: IpProtocol,
+    src_port: u16,
+    dst_port: u16,
+) -> Vec<u8> {
+    let l4_len = match proto {
+        IpProtocol::Tcp => 20usize,
+        IpProtocol::Udp => 8usize,
+        _ => 8usize,
+    };
+    let mut buf = Vec::with_capacity(14 + 40 + l4_len);
+    buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    buf.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    buf.extend_from_slice(&0x86ddu16.to_be_bytes());
+    buf.push(0x60);
+    buf.extend_from_slice(&[0u8, 0u8, 0u8]);
+    buf.extend_from_slice(&(l4_len as u16).to_be_bytes());
+    buf.push(ip_proto_num(proto));
+    buf.push(64);
+    buf.extend_from_slice(&src);
+    buf.extend_from_slice(&dst);
+    match proto {
+        IpProtocol::Tcp => {
+            buf.extend_from_slice(&src_port.to_be_bytes());
+            buf.extend_from_slice(&dst_port.to_be_bytes());
+            buf.extend_from_slice(&1u32.to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf.push(0x50);
+            buf.push(0x10);
+            buf.extend_from_slice(&65535u16.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+        }
+        IpProtocol::Udp => {
+            buf.extend_from_slice(&src_port.to_be_bytes());
+            buf.extend_from_slice(&dst_port.to_be_bytes());
+            buf.extend_from_slice(&(l4_len as u16).to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+        }
+        _ => {
+            buf.extend_from_slice(&[0u8; 8]);
+        }
+    }
+    buf
+}
+
+fn ip_proto_num(proto: IpProtocol) -> u8 {
+    match proto {
+        IpProtocol::Tcp => 6,
+        IpProtocol::Udp => 17,
+        IpProtocol::Icmpv4 => 1,
+        IpProtocol::Icmpv6 => 58,
+        IpProtocol::Other(v) => v,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2438,8 +2773,9 @@ fn print_usage_and_exit() {
     eprintln!(
         "  aegis eval --rules rules.txt --direction ingress --hex \"<hex bytes>\" [--iface eth0] [--disable-iface eth0] [--no-logs]"
     );
-    eprintln!("  aegis capture --rules rules.txt --iface eth0 [--count 10] [--no-logs]");
+    eprintln!("  aegis capture --rules rules.txt --iface eth0 [--count 10] [--worker-stats] [--no-logs]");
     eprintln!("  aegis metrics --rules rules.txt [--policies policies.txt] [--iface eth0]");
+    eprintln!("  aegis rss-balance --flows 100000 --workers 4 [--protocol tcp|udp] [--ipv6]");
     eprintln!("  aegis dataplane-diag");
     std::process::exit(1);
 }
@@ -2598,5 +2934,25 @@ mod tests {
         let mut issues = Vec::new();
         validate_dpdk_diag(&cfg, &hugepages, &numa_nodes, &mut warnings, &mut issues).unwrap();
         assert!(!issues.is_empty());
+    }
+
+    #[test]
+    fn rss_balance_ipv4_packet_hashes() {
+        let rss = RssConfig::default();
+        let sharder = FlowSharder::new(&rss, 4);
+        let pkt = build_ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2], IpProtocol::Tcp, 1234, 80);
+        let idx = sharder.select_queue(&pkt);
+        assert!(idx < 4);
+    }
+
+    #[test]
+    fn rss_balance_ipv6_packet_hashes() {
+        let rss = RssConfig::default();
+        let sharder = FlowSharder::new(&rss, 4);
+        let pkt = build_ipv6_packet([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                                    [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                                    IpProtocol::Udp, 1234, 53);
+        let idx = sharder.select_queue(&pkt);
+        assert!(idx < 4);
     }
 }

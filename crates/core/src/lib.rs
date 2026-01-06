@@ -1290,6 +1290,10 @@ impl FirewallManager {
         self.flows.capacity()
     }
 
+    pub fn flow_shard_count(&self) -> usize {
+        self.flows.shard_count()
+    }
+
     pub fn set_failover_enabled(&mut self, enabled: bool) {
         self.failover_enabled = enabled;
     }

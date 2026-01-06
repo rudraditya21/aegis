@@ -106,9 +106,12 @@ spawns queue-affine workers; for pcap it uses software hashing to shard flows ac
 ### Performance & Diagnostics
 
 - Perf/stress harness: `bash scripts/run_perf_stress.sh`
+- RSS balance benchmark: `bash scripts/run_rss_balance.sh`
 - Full regression battery: `bash scripts/run_all_tests.sh`
 - Dataplane readiness: `cargo run -p aegis -- dataplane-diag`
 - Metrics (include dataplane stats with `--iface`): `cargo run -p aegis -- metrics --rules /etc/aegis/rules/l3l4.rules --iface eth0`
+- Per-core worker balance (live traffic): `cargo run -p aegis -- capture --rules /etc/aegis/rules/l3l4.rules --iface eth0 --count 10000 --worker-stats`
+- CI build matrix: `.github/workflows/ci.yml` builds `pcap`, `af-xdp`, and `dpdk` on Linux.
 
 ### Rule File Format
 
@@ -120,6 +123,24 @@ One rule per line (`#` for comments):
 - `default deny ingress`
 
 Evaluation order: LPM CIDR → port range/exact → protocol → default (directional) → implicit deny.
+
+### Backend Requirements & Tuning
+
+AF_XDP (Linux only):
+- Kernel/XDP-capable NIC + driver, bpffs mounted at `/sys/fs/bpf`.
+- Optional bundled XDP program pinning uses `pin-dir`, `program-name`, and `map-name`.
+- UMEM tuning: `umem-frames`, `frame-size`, `headroom`.
+- Hugepages/NUMA: `use-hugepages`, `hugepage-size-kb`, `numa-node`, and `*-fallback` flags.
+
+DPDK (Linux only):
+- Requires DPDK userspace drivers (vfio/uio), hugepages (or `no-huge=true`), and port binding.
+- Queue/core mapping: `core-mask`, `rx-queues`, `tx-queues`, `queue-sockets`.
+- Memory tuning: `mbuf-count`, `mbuf-cache`, `rx-desc`, `tx-desc`, `rx-burst`, `tx-burst`.
+
+Operational tuning:
+- `rss.*` aligns flow distribution with RX queues and CPU affinity.
+- `flow-shards` should match worker count for per-core isolation.
+- Use `dataplane-diag` and `metrics --iface` to verify hugepage/NUMA readiness and zero-copy support.
 
 ## Implemented Features
 
