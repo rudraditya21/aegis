@@ -1,0 +1,32 @@
+ARG RUST_VERSION=1.82
+ARG BUILD_PROFILE=release
+ARG CARGO_FEATURES=pcap
+
+FROM rust:${RUST_VERSION}-slim AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --profile ${BUILD_PROFILE} -p aegis --features ${CARGO_FEATURES}
+
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM ${RUNTIME_BASE}
+
+SHELL ["/bin/sh", "-c"]
+RUN if command -v useradd >/dev/null 2>&1; then \
+        useradd --system --create-home --uid 1000 aegis; \
+    elif command -v adduser >/dev/null 2>&1; then \
+        adduser --system --uid 1000 aegis; \
+    else \
+        echo "useradd/adduser not found" && exit 1; \
+    fi
+
+WORKDIR /home/aegis
+RUN mkdir -p /config /var/log/aegis && chown -R aegis:aegis /var/log/aegis
+COPY --from=builder /app/target/${BUILD_PROFILE}/aegis /usr/local/bin/aegis
+
+USER aegis
+ENV AEGIS_CONFIG_ROOT=/config \
+    AEGIS_CONFIG_READONLY=1 \
+    FIREWALL_CONFIG_ROOT=/config \
+    FIREWALL_CONFIG_READONLY=1
+
+ENTRYPOINT ["aegis"]
