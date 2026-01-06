@@ -298,29 +298,21 @@ mod linux {
     struct HugepageInfo {
         total: u64,
         free: u64,
-        size_kb: usize,
     }
 
     fn hugepage_info() -> Option<HugepageInfo> {
         let body = fs::read_to_string("/proc/meminfo").ok()?;
         let mut total = None;
         let mut free = None;
-        let mut size_kb = None;
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("HugePages_Total:") {
                 total = rest.split_whitespace().next().and_then(|v| v.parse().ok());
             } else if let Some(rest) = line.strip_prefix("HugePages_Free:") {
                 free = rest.split_whitespace().next().and_then(|v| v.parse().ok());
-            } else if let Some(rest) = line.strip_prefix("Hugepagesize:") {
-                size_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
             }
         }
-        match (total, free, size_kb) {
-            (Some(total), Some(free), Some(size_kb)) => Some(HugepageInfo {
-                total,
-                free,
-                size_kb,
-            }),
+        match (total, free) {
+            (Some(total), Some(free)) => Some(HugepageInfo { total, free }),
             _ => None,
         }
     }
@@ -422,7 +414,6 @@ mod linux {
         rx_queue: u16,
         tx_queue: u16,
         rx_queues: u16,
-        tx_queues: u16,
         mempool: *mut rte_mempool,
         mempool_socket: Option<i32>,
         port_socket: Option<i32>,
@@ -431,7 +422,6 @@ mod linux {
         rx_buf: Vec<*mut rte_mbuf>,
         tx_buf: Vec<*mut rte_mbuf>,
         rx_burst: u16,
-        tx_burst: u16,
         rx_count: u64,
         tx_count: u64,
     }
@@ -505,16 +495,14 @@ mod linux {
                 rx_queue,
                 tx_queue,
                 rx_queues: port_state.config.rx_queues,
-                tx_queues: port_state.config.tx_queues,
                 mempool: mbuf_pool,
                 mempool_socket,
                 port_socket,
                 hugepages: port_state.hugepages,
                 rx_cache: Vec::with_capacity(rx_burst as usize),
                 rx_buf: vec![ptr::null_mut(); rx_burst as usize],
-                tx_buf: vec![ptr::null_mut(); 1],
+                tx_buf: vec![ptr::null_mut(); tx_burst as usize],
                 rx_burst,
-                tx_burst,
                 rx_count: 0,
                 tx_count: 0,
             })

@@ -513,7 +513,6 @@ struct BpfObjPinAttr {
 #[derive(Debug)]
 pub struct AfXdpFrame<'a> {
     data: &'a [u8],
-    addr: u64,
 }
 
 impl AfXdpFrame<'_> {
@@ -526,7 +525,6 @@ impl AfXdpFrame<'_> {
 struct Umem {
     base: *mut u8,
     len: usize,
-    frame_size: usize,
     headroom: usize,
     hugepages: bool,
     numa_node: Option<i32>,
@@ -540,7 +538,7 @@ struct RingU64 {
     producer: *mut u32,
     consumer: *mut u32,
     desc: *mut u64,
-    flags: *mut u32,
+    _flags: *mut u32,
     size: u32,
     mask: u32,
 }
@@ -605,7 +603,7 @@ impl AfXdpDataplane {
         let rc = unsafe {
             libc::setsockopt(
                 sock,
-                SOL_XDP(),
+                sol_xdp(),
                 XDP_UMEM_REG,
                 &reg as *const _ as *const c_void,
                 size_of::<XdpUmemReg>() as socklen_t,
@@ -654,7 +652,7 @@ impl AfXdpDataplane {
         let rc = unsafe {
             libc::getsockopt(
                 sock,
-                SOL_XDP(),
+                sol_xdp(),
                 XDP_MMAP_OFFSETS,
                 &mut offsets as *mut _ as *mut c_void,
                 &mut optlen as *mut _,
@@ -681,7 +679,6 @@ impl AfXdpDataplane {
         let mut umem = Umem {
             base: umem_base,
             len: umem_len,
-            frame_size,
             headroom,
             hugepages: umem_hugepages,
             numa_node: umem_numa_node,
@@ -894,7 +891,7 @@ impl AfXdpDataplane {
         let data = unsafe { slice::from_raw_parts(data_ptr, desc.len as usize) };
         self.last_rx_addr = Some(self.umem.frame_base(addr));
         self.rx_count = self.rx_count.wrapping_add(1);
-        Ok(Some(AfXdpFrame { data, addr }))
+        Ok(Some(AfXdpFrame { data }))
     }
 
     pub fn send_frame(&mut self, frame: &AfXdpFrame<'_>) -> Result<(), AfXdpError> {
@@ -959,7 +956,7 @@ impl AfXdpDataplane {
         let rc = unsafe {
             libc::getsockopt(
                 self.sock,
-                SOL_XDP(),
+                sol_xdp(),
                 XDP_STATISTICS,
                 &mut stats as *mut _ as *mut c_void,
                 &mut len,
@@ -1050,7 +1047,7 @@ fn set_ring_size(sock: RawFd, opt: c_int, size: u32) -> Result<(), AfXdpError> {
     let rc = unsafe {
         libc::setsockopt(
             sock,
-            SOL_XDP(),
+            sol_xdp(),
             opt,
             &size as *const _ as *const c_void,
             size_of::<u32>() as socklen_t,
@@ -1110,7 +1107,7 @@ fn map_ring_u64(sock: RawFd, offset: i64, ring: &XdpRingOffset, size: u32) -> Re
         producer: unsafe { base.add(ring.producer as usize) } as *mut u32,
         consumer: unsafe { base.add(ring.consumer as usize) } as *mut u32,
         desc: unsafe { base.add(ring.desc as usize) } as *mut u64,
-        flags: unsafe { base.add(ring.flags as usize) } as *mut u32,
+        _flags: unsafe { base.add(ring.flags as usize) } as *mut u32,
         size,
         mask: size - 1,
     })
@@ -1230,7 +1227,7 @@ fn attach_xdp_fd(ifindex: u32, prog_fd: RawFd, flags: XdpAttachFlags) -> Result<
     }
     let mut req = Vec::new();
     let nlmsg_len = size_of::<libc::nlmsghdr>() + size_of::<IfInfoMsg>();
-    let mut hdr = libc::nlmsghdr {
+    let hdr = libc::nlmsghdr {
         nlmsg_len: nlmsg_len as u32,
         nlmsg_type: libc::RTM_SETLINK,
         nlmsg_flags: (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
@@ -1336,7 +1333,7 @@ fn nla_align(len: usize) -> usize {
     (len + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
 }
 
-fn SOL_XDP() -> c_int {
+fn sol_xdp() -> c_int {
     // From linux/socket.h
     283
 }
@@ -1356,7 +1353,6 @@ mod tests {
         let mut umem = Umem {
             base: ptr::null_mut(),
             len: 0,
-            frame_size: 2048,
             headroom: 256,
             hugepages: false,
             numa_node: None,
@@ -1365,7 +1361,7 @@ mod tests {
                 producer: ptr::null_mut(),
                 consumer: ptr::null_mut(),
                 desc: ptr::null_mut(),
-                flags: ptr::null_mut(),
+                _flags: ptr::null_mut(),
                 size: 0,
                 mask: 0,
             },
@@ -1373,7 +1369,7 @@ mod tests {
                 producer: ptr::null_mut(),
                 consumer: ptr::null_mut(),
                 desc: ptr::null_mut(),
-                flags: ptr::null_mut(),
+                _flags: ptr::null_mut(),
                 size: 0,
                 mask: 0,
             },
