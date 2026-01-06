@@ -1,0 +1,116 @@
+name: ci-real-traffic
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: generator|server|both
+        required: true
+        default: generator
+      iface:
+        description: Interface for tcpreplay (required when --pcap is set)
+        required: false
+        default: ""
+      pcap:
+        description: PCAP path on runner host
+        required: false
+        default: ""
+      tcpreplay_args:
+        description: Extra tcpreplay args
+        required: false
+        default: ""
+      iperf_server:
+        description: iperf3 server host (for generator mode)
+        required: false
+        default: ""
+      iperf_port:
+        description: iperf3 server/client port
+        required: false
+        default: "5201"
+      iperf_time:
+        description: iperf3 duration (seconds)
+        required: false
+        default: "10"
+      iperf_parallel:
+        description: iperf3 parallel streams
+        required: false
+        default: "1"
+      iperf_server_args:
+        description: Extra iperf3 server args
+        required: false
+        default: ""
+      iperf_args:
+        description: Extra iperf3 client args
+        required: false
+        default: ""
+      iperf_server_persist:
+        description: Keep iperf3 server running
+        required: false
+        type: boolean
+        default: false
+      skip_tcpreplay:
+        description: Skip tcpreplay even if PCAP provided
+        required: false
+        type: boolean
+        default: false
+      skip_iperf:
+        description: Skip iperf3 even if server provided
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: Print commands without executing
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  real-traffic:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run real traffic validation
+        env:
+          MODE: ${{ inputs.mode }}
+          IFACE: ${{ inputs.iface }}
+          PCAP: ${{ inputs.pcap }}
+          TCPREPLAY_ARGS: ${{ inputs.tcpreplay_args }}
+          IPERF_SERVER: ${{ inputs.iperf_server }}
+          IPERF_PORT: ${{ inputs.iperf_port }}
+          IPERF_TIME: ${{ inputs.iperf_time }}
+          IPERF_PARALLEL: ${{ inputs.iperf_parallel }}
+          IPERF_SERVER_ARGS: ${{ inputs.iperf_server_args }}
+          IPERF_ARGS: ${{ inputs.iperf_args }}
+          IPERF_SERVER_PERSIST: ${{ inputs.iperf_server_persist }}
+          SKIP_TCPREPLAY: ${{ inputs.skip_tcpreplay }}
+          SKIP_IPERF: ${{ inputs.skip_iperf }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--mode "$MODE")
+          if [[ -n "$IFACE" ]]; then args+=(--iface "$IFACE"); fi
+          if [[ -n "$PCAP" ]]; then args+=(--pcap "$PCAP"); fi
+          if [[ -n "$TCPREPLAY_ARGS" ]]; then args+=(--tcpreplay-args "$TCPREPLAY_ARGS"); fi
+          if [[ -n "$IPERF_SERVER" ]]; then args+=(--iperf-server "$IPERF_SERVER"); fi
+          if [[ -n "$IPERF_PORT" ]]; then args+=(--iperf-port "$IPERF_PORT"); fi
+          if [[ -n "$IPERF_TIME" ]]; then args+=(--iperf-time "$IPERF_TIME"); fi
+          if [[ -n "$IPERF_PARALLEL" ]]; then args+=(--iperf-parallel "$IPERF_PARALLEL"); fi
+          if [[ -n "$IPERF_SERVER_ARGS" ]]; then args+=(--iperf-server-args "$IPERF_SERVER_ARGS"); fi
+          if [[ -n "$IPERF_ARGS" ]]; then args+=(--iperf-args "$IPERF_ARGS"); fi
+          if [[ "$IPERF_SERVER_PERSIST" == "true" ]]; then args+=(--iperf-server-persist); fi
+          if [[ "$SKIP_TCPREPLAY" == "true" ]]; then args+=(--skip-tcpreplay); fi
+          if [[ "$SKIP_IPERF" == "true" ]]; then args+=(--skip-iperf); fi
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+
+          if [[ -n "$PCAP" && "$SKIP_TCPREPLAY" != "true" ]]; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo -E bash scripts/run_real_traffic_validation.sh "${args[@]}"
+            else
+              echo "sudo not available; tcpreplay may fail without privileges."
+              bash scripts/run_real_traffic_validation.sh "${args[@]}"
+            fi
+          else
+            bash scripts/run_real_traffic_validation.sh "${args[@]}"
+          fi

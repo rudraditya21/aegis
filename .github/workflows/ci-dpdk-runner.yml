@@ -1,0 +1,32 @@
+name: ci-dpdk-runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-linux-dpdk:
+    runs-on: [self-hosted, linux, dpdk]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (apt)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y pkg-config libpcap-dev || true
+            sudo apt-get install -y libdpdk-dev || sudo apt-get install -y dpdk-dev
+          else
+            echo "apt-get not found; ensure DPDK dev packages + pkg-config are preinstalled."
+          fi
+          if command -v pkg-config >/dev/null 2>&1; then
+            if ! pkg-config --exists libdpdk; then
+              echo "libdpdk not found via pkg-config; install DPDK dev packages." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Rust tests (dpdk)
+        run: |
+          bash docker/run_ci_tests.sh dpdk

@@ -198,7 +198,9 @@ Operational tuning:
 CI guidance:
 - CI runs unit/regression/feature-matrix suites only; real-traffic validation (tcpreplay/iperf3) requires privileged NIC access and is expected to run on a testbed or self-hosted runner.
 - Use `dataplane-diag` and `metrics --iface` in staging to confirm RSS/zero-copy/NUMA/shard affinity before load testing.
-- Real-traffic validation expects `tcpreplay` and `iperf3` installed on the traffic generator host(s).
+- Real-traffic validation expects `tcpreplay` and `iperf3` installed on the traffic generator host(s). `tcpreplay` requires elevated privileges (run as root or via sudo).
+- Optional GitHub Actions workflow `ci-real-traffic.yml` runs on a self-hosted Linux runner; install `tcpreplay` + `iperf3`, grant passwordless sudo for tcpreplay, and attach a NIC-capable host.
+- Dedicated self-hosted workflows `ci-af-xdp-runner.yml` and `ci-dpdk-runner.yml` target AF_XDP/DPDK hosts with required kernel/DPDK dependencies.
 
 ## Shortcuts
 
@@ -207,3 +209,21 @@ CI guidance:
 - Real traffic: `bash scripts/run_real_traffic_validation.sh --iface eth0 --pcap sample.pcap --iperf-server 10.0.0.2`
 - Stability smoke (5m): `SOAK_DURATION=300 bash scripts/run_long_soak.sh`
 - Everything (tests + attacks + feature matrix): `bash scripts/run_all_tests.sh`
+
+## Real Traffic Validation Bundle
+
+Generator host (replay + throughput):
+- `sudo bash scripts/run_real_traffic_validation.sh --mode generator --iface eth0 --pcap traces/traffic.pcap --iperf-server 10.0.0.2 --iperf-time 30`
+
+iperf3 server host (one-shot, exits after a client run):
+- `bash scripts/run_real_traffic_validation.sh --mode server --iperf-port 5201`
+
+Optional combined local test (server + generator on same host):
+- `sudo bash scripts/run_real_traffic_validation.sh --mode both --iface eth0 --pcap traces/traffic.pcap --iperf-server 127.0.0.1 --iperf-time 10`
+
+On the DUT, validate readiness before and after traffic:
+- `aegis dataplane-diag`
+- `aegis metrics --iface <ifname>`
+
+GitHub Actions (self-hosted) trigger:
+- Run `ci-real-traffic` via `workflow_dispatch` with runner labels `self-hosted` + `linux`, and set inputs for `mode`, `iface`, `pcap`, and iperf options as needed.

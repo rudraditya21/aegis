@@ -1,0 +1,25 @@
+name: ci-af-xdp-runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-linux-af-xdp:
+    runs-on: [self-hosted, linux, af-xdp]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (apt)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y libpcap-dev pkg-config
+          else
+            echo "apt-get not found; ensure libpcap-dev and pkg-config are preinstalled."
+          fi
+
+      - name: Rust tests (af-xdp)
+        run: |
+          bash docker/run_ci_tests.sh af-xdp
