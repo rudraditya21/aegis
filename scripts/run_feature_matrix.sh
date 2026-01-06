@@ -111,4 +111,7 @@ echo "[5/5] List rules and policies after actions..."
 cargo run -p aegis -- list-rules --rules "$RULES_FILE"
 cargo run -p aegis -- list-policies --policies "$POLICY_FILE"
 
+echo "[diag] Dataplane diagnostics..."
+cargo run -p aegis -- dataplane-diag
+
 echo "Feature matrix run complete."

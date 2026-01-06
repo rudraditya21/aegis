@@ -32,3 +32,9 @@ cargo run -p aegis -- remove-rule --rules "$RULES_FILE" --id 2
 
 echo "Rules after removal:"
 cargo run -p aegis -- list-rules --rules "$RULES_FILE"
+
+echo "Checking metrics output (no iface)..."
+cargo run -p aegis -- metrics --rules "$RULES_FILE"
+
+echo "Running dataplane diagnostics..."
+cargo run -p aegis -- dataplane-diag

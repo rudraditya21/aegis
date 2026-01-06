@@ -103,6 +103,13 @@ Supported backends: `pcap` (default). `af-xdp` and `dpdk` require compiled backe
 When `rss.enabled` is true, aegis uses RSS hashing for flow sharding. On RSS-capable backends it
 spawns queue-affine workers; for pcap it uses software hashing to shard flows across workers.
 
+### Performance & Diagnostics
+
+- Perf/stress harness: `bash scripts/run_perf_stress.sh`
+- Full regression battery: `bash scripts/run_all_tests.sh`
+- Dataplane readiness: `cargo run -p aegis -- dataplane-diag`
+- Metrics (include dataplane stats with `--iface`): `cargo run -p aegis -- metrics --rules /etc/aegis/rules/l3l4.rules --iface eth0`
+
 ### Rule File Format
 
 One rule per line (`#` for comments):

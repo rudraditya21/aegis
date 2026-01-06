@@ -2564,4 +2564,39 @@ mod tests {
         let err = resolve_shard_plan(&cfg).unwrap_err();
         assert!(err.contains("cpu_affinity length"));
     }
+
+    #[test]
+    fn af_xdp_diag_warns_on_hugepage_size_mismatch_with_fallback() {
+        let mut cfg = dataplane::AfXdpConfig::default();
+        cfg.use_hugepages = true;
+        cfg.hugepage_size_kb = Some(2048);
+        cfg.hugepage_fallback = true;
+        let hugepages = Ok(HugepageInfo {
+            total: 10,
+            free: 10,
+            size_kb: 1024,
+        });
+        let numa_nodes = Ok(vec![0u32]);
+        let mut warnings = Vec::new();
+        let mut issues = Vec::new();
+        validate_af_xdp_diag(&cfg, &hugepages, &numa_nodes, &mut warnings, &mut issues).unwrap();
+        assert!(!warnings.is_empty());
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn dpdk_diag_errors_when_hugepages_required_and_unavailable() {
+        let mut cfg = dataplane::DpdkConfig::default();
+        cfg.hugepage_fallback = false;
+        let hugepages = Ok(HugepageInfo {
+            total: 0,
+            free: 0,
+            size_kb: 2048,
+        });
+        let numa_nodes = Ok(vec![0u32]);
+        let mut warnings = Vec::new();
+        let mut issues = Vec::new();
+        validate_dpdk_diag(&cfg, &hugepages, &numa_nodes, &mut warnings, &mut issues).unwrap();
+        assert!(!issues.is_empty());
+    }
 }
