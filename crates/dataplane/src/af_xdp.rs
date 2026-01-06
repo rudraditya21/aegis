@@ -1,6 +1,11 @@
-use crate::{Dataplane, DataplaneCapabilities, DataplaneError, DataplaneStats, FrameView, RssConfig};
+use crate::{
+    Dataplane, DataplaneCapabilities, DataplaneError, DataplaneStats, FrameView, RssConfig,
+    TxLease,
+};
 
-pub use aegis_af_xdp::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode};
+pub use aegis_af_xdp::{
+    AfXdpDataplane, AfXdpFrame, AfXdpTxLease, XdpAttachFlags, XdpAttachMode,
+};
 
 impl FrameView for AfXdpFrame<'_> {
     fn bytes(&self) -> &[u8] {
@@ -14,9 +19,14 @@ impl FrameView for AfXdpFrame<'_> {
 
 impl Dataplane for AfXdpDataplane {
     type Frame<'a> = AfXdpFrame<'a>;
+    type Tx<'a> = AfXdpTxLease<'a>;
 
     fn next_frame(&mut self) -> Result<Option<Self::Frame<'_>>, DataplaneError> {
         self.next_frame().map_err(map_err)
+    }
+
+    fn lease_tx(&mut self, len: usize) -> Result<Self::Tx<'_>, DataplaneError> {
+        AfXdpDataplane::lease_tx(self, len).map_err(map_err)
     }
 
     fn send_frame(&mut self, frame: &Self::Frame<'_>) -> Result<(), DataplaneError> {
@@ -47,6 +57,16 @@ impl Dataplane for AfXdpDataplane {
             supports_tx: true,
             supports_filters: false,
         }
+    }
+}
+
+impl TxLease for AfXdpTxLease<'_> {
+    fn buffer(&mut self) -> &mut [u8] {
+        AfXdpTxLease::buffer(self)
+    }
+
+    fn commit(self, len: usize) -> Result<(), DataplaneError> {
+        AfXdpTxLease::commit(self, len).map_err(map_err)
     }
 }
 

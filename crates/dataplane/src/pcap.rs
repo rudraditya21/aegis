@@ -1,6 +1,6 @@
 use crate::{
     Dataplane, DataplaneCapabilities, DataplaneError, DataplaneStats, FrameView, PcapConfig,
-    RssConfig,
+    RssConfig, UnsupportedTxLease,
 };
 use pcap_shim::Capture;
 use std::time::SystemTime;
@@ -42,6 +42,7 @@ impl FrameView for PcapFrame<'_> {
 
 impl Dataplane for PcapDataplane {
     type Frame<'a> = PcapFrame<'a>;
+    type Tx<'a> = UnsupportedTxLease;
 
     fn next_frame(&mut self) -> Result<Option<Self::Frame<'_>>, DataplaneError> {
         match self.capture.next() {
@@ -52,6 +53,12 @@ impl Dataplane for PcapDataplane {
             Ok(None) => Ok(None),
             Err(e) => Err(DataplaneError::Backend(e)),
         }
+    }
+
+    fn lease_tx(&mut self, _len: usize) -> Result<Self::Tx<'_>, DataplaneError> {
+        Err(DataplaneError::Unsupported(
+            "pcap backend does not support tx leasing",
+        ))
     }
 
     fn send_frame(&mut self, _frame: &Self::Frame<'_>) -> Result<(), DataplaneError> {

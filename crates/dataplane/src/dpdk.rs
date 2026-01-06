@@ -1,9 +1,9 @@
 use crate::{
     Dataplane, DataplaneCapabilities, DataplaneError, DataplaneStats, FrameView, RssConfig,
-    RssHashField,
+    RssHashField, TxLease,
 };
 
-pub use aegis_dpdk::{DpdkDataplane, DpdkFrame};
+pub use aegis_dpdk::{DpdkDataplane, DpdkFrame, DpdkTxLease};
 
 impl FrameView for DpdkFrame<'_> {
     fn bytes(&self) -> &[u8] {
@@ -17,9 +17,14 @@ impl FrameView for DpdkFrame<'_> {
 
 impl Dataplane for DpdkDataplane {
     type Frame<'a> = DpdkFrame<'a>;
+    type Tx<'a> = DpdkTxLease<'a>;
 
     fn next_frame(&mut self) -> Result<Option<Self::Frame<'_>>, DataplaneError> {
         self.next_frame().map_err(map_err)
+    }
+
+    fn lease_tx(&mut self, len: usize) -> Result<Self::Tx<'_>, DataplaneError> {
+        DpdkDataplane::lease_tx(self, len).map_err(map_err)
     }
 
     fn send_frame(&mut self, frame: &Self::Frame<'_>) -> Result<(), DataplaneError> {
@@ -60,6 +65,16 @@ impl Dataplane for DpdkDataplane {
             supports_tx: true,
             supports_filters: false,
         }
+    }
+}
+
+impl TxLease for DpdkTxLease<'_> {
+    fn buffer(&mut self) -> &mut [u8] {
+        DpdkTxLease::buffer(self)
+    }
+
+    fn commit(self, len: usize) -> Result<(), DataplaneError> {
+        DpdkTxLease::commit(self, len).map_err(map_err)
     }
 }
 

@@ -283,13 +283,50 @@ pub trait FrameView {
     fn timestamp(&self) -> Option<SystemTime>;
 }
 
+/// Writable TX buffer that can be committed without extra copies.
+pub trait TxLease {
+    fn buffer(&mut self) -> &mut [u8];
+    fn commit(self, len: usize) -> Result<(), DataplaneError>;
+}
+
+#[derive(Debug)]
+pub struct UnsupportedTxLease {
+    buf: [u8; 0],
+}
+
+impl TxLease for UnsupportedTxLease {
+    fn buffer(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    fn commit(self, _len: usize) -> Result<(), DataplaneError> {
+        Err(DataplaneError::Unsupported("tx lease not supported"))
+    }
+}
+
 pub trait Dataplane {
     type Frame<'a>: FrameView
     where
         Self: 'a;
+    type Tx<'a>: TxLease
+    where
+        Self: 'a;
 
     fn next_frame(&mut self) -> Result<Option<Self::Frame<'_>>, DataplaneError>;
+    /// Lease a TX buffer for zero-copy writes when supported.
+    fn lease_tx(&mut self, len: usize) -> Result<Self::Tx<'_>, DataplaneError>;
     fn send_frame(&mut self, frame: &Self::Frame<'_>) -> Result<(), DataplaneError>;
+    fn send_bytes(&mut self, data: &[u8]) -> Result<(), DataplaneError> {
+        let mut lease = self.lease_tx(data.len())?;
+        let buf = lease.buffer();
+        if buf.len() < data.len() {
+            return Err(DataplaneError::Backend(
+                "tx lease shorter than requested length".into(),
+            ));
+        }
+        buf[..data.len()].copy_from_slice(data);
+        lease.commit(data.len())
+    }
     fn stats(&mut self) -> Result<DataplaneStats, DataplaneError>;
     fn configure_rss(&mut self, rss: &RssConfig) -> Result<(), DataplaneError>;
     fn capabilities(&self) -> DataplaneCapabilities;
@@ -335,6 +372,37 @@ impl FrameView for AnyFrame<'_> {
             AnyFrame::AfXdp(frame) => frame.timestamp(),
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
             AnyFrame::Dpdk(frame) => frame.timestamp(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AnyTxLease<'a> {
+    #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+    AfXdp(af_xdp::AfXdpTxLease<'a>),
+    #[cfg(all(feature = "dpdk", target_os = "linux"))]
+    Dpdk(dpdk::DpdkTxLease<'a>),
+    Unsupported(UnsupportedTxLease),
+}
+
+impl TxLease for AnyTxLease<'_> {
+    fn buffer(&mut self) -> &mut [u8] {
+        match self {
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            AnyTxLease::AfXdp(lease) => TxLease::buffer(lease),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            AnyTxLease::Dpdk(lease) => TxLease::buffer(lease),
+            AnyTxLease::Unsupported(lease) => TxLease::buffer(lease),
+        }
+    }
+
+    fn commit(self, len: usize) -> Result<(), DataplaneError> {
+        match self {
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            AnyTxLease::AfXdp(lease) => TxLease::commit(lease, len),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            AnyTxLease::Dpdk(lease) => TxLease::commit(lease, len),
+            AnyTxLease::Unsupported(lease) => TxLease::commit(lease, len),
         }
     }
 }
@@ -494,6 +562,7 @@ impl DataplaneHandle {
 
 impl Dataplane for DataplaneHandle {
     type Frame<'a> = AnyFrame<'a>;
+    type Tx<'a> = AnyTxLease<'a>;
 
     fn next_frame(&mut self) -> Result<Option<Self::Frame<'_>>, DataplaneError> {
         match self {
@@ -507,6 +576,21 @@ impl Dataplane for DataplaneHandle {
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
             DataplaneHandle::Dpdk(dp) => <DpdkDataplane as Dataplane>::next_frame(dp)
                 .map(|opt| opt.map(AnyFrame::Dpdk)),
+        }
+    }
+
+    fn lease_tx(&mut self, len: usize) -> Result<Self::Tx<'_>, DataplaneError> {
+        match self {
+            #[cfg(feature = "pcap")]
+            DataplaneHandle::Pcap(_) => Err(DataplaneError::Unsupported(
+                "pcap backend does not support tx leasing",
+            )),
+            #[cfg(all(feature = "af-xdp", target_os = "linux"))]
+            DataplaneHandle::AfXdp(dp) => <AfXdpDataplane as Dataplane>::lease_tx(dp, len)
+                .map(AnyTxLease::AfXdp),
+            #[cfg(all(feature = "dpdk", target_os = "linux"))]
+            DataplaneHandle::Dpdk(dp) => <DpdkDataplane as Dataplane>::lease_tx(dp, len)
+                .map(AnyTxLease::Dpdk),
         }
     }
 

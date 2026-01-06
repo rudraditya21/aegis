@@ -177,12 +177,28 @@ mod stub {
         data: &'a [u8],
     }
 
+    #[derive(Debug)]
+    pub struct DpdkTxLease<'a> {
+        buf: [u8; 0],
+        _marker: std::marker::PhantomData<&'a mut ()>,
+    }
+
     impl DpdkFrame<'_> {
         pub fn bytes(&self) -> &[u8] {
             self.data
         }
 
         pub fn mark_sent(&self) {}
+    }
+
+    impl DpdkTxLease<'_> {
+        pub fn buffer(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        pub fn commit(self, _len: usize) -> Result<(), DpdkError> {
+            Err(DpdkError::Unsupported("dpdk not enabled"))
+        }
     }
 
     impl DpdkDataplane {
@@ -195,6 +211,10 @@ mod stub {
         }
 
         pub fn send_frame(&mut self, _frame: &DpdkFrame<'_>) -> Result<(), DpdkError> {
+            Err(DpdkError::Unsupported("dpdk not enabled"))
+        }
+
+        pub fn lease_tx(&mut self, _len: usize) -> Result<DpdkTxLease<'_>, DpdkError> {
             Err(DpdkError::Unsupported("dpdk not enabled"))
         }
 
@@ -217,12 +237,12 @@ mod stub {
 }
 
 #[cfg(not(all(feature = "dpdk", target_os = "linux")))]
-pub use stub::{DpdkDataplane, DpdkFrame};
+pub use stub::{DpdkDataplane, DpdkFrame, DpdkTxLease};
 
 #[cfg(all(feature = "dpdk", target_os = "linux"))]
 mod linux {
     use super::{build_rss_key, rss_fields_mask, DpdkConfig, DpdkError, DpdkRssConfig};
-    use libc::{c_char, c_int, c_uint};
+    use libc::{c_char, c_int, c_uint, c_void};
     use std::cell::Cell;
     use std::ffi::CString;
     use std::fs;
@@ -344,6 +364,8 @@ mod linux {
             data_room_size: u16,
             socket_id: c_int,
         ) -> *mut rte_mempool;
+        fn rte_pktmbuf_append(m: *mut rte_mbuf, len: u16) -> *mut c_void;
+        fn rte_pktmbuf_trim(m: *mut rte_mbuf, len: u16) -> c_int;
         fn rte_pktmbuf_free(m: *mut rte_mbuf);
         fn rte_strerror(errnum: c_int) -> *const c_char;
     }
@@ -365,7 +387,6 @@ mod linux {
         ) -> c_int;
         fn aegis_dpdk_mbuf_data(m: *const rte_mbuf) -> *const u8;
         fn aegis_dpdk_mbuf_data_len(m: *const rte_mbuf) -> u16;
-        fn aegis_dpdk_mbuf_write(m: *mut rte_mbuf, data: *const u8, len: u16) -> c_int;
         fn aegis_dpdk_stats_get(port_id: u16, out: *mut ShimStats) -> c_int;
         fn aegis_dpdk_port_by_name(name: *const c_char, out_port: *mut u16) -> c_int;
         fn aegis_dpdk_rss_info(port_id: u16, out: *mut ShimRssInfo) -> c_int;
@@ -406,6 +427,22 @@ mod linux {
                 unsafe { rte_pktmbuf_free(self.mbuf) };
             }
         }
+    }
+
+    #[derive(Debug)]
+    pub struct DpdkTxLease<'a> {
+        dataplane: &'a mut DpdkDataplane,
+        mbuf: *mut rte_mbuf,
+        data: *mut u8,
+        capacity: usize,
+        state: TxLeaseState,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TxLeaseState {
+        Held,
+        Submitted,
+        Released,
     }
 
     #[derive(Debug)]
@@ -536,6 +573,28 @@ mod linux {
             Ok(first.map(|mbuf| self.wrap_mbuf(mbuf)))
         }
 
+        pub fn lease_tx(&mut self, len: usize) -> Result<DpdkTxLease<'_>, DpdkError> {
+            if len == 0 {
+                return Err(DpdkError::Config("tx length must be > 0".into()));
+            }
+            if len > u16::MAX as usize {
+                return Err(DpdkError::Config("tx length exceeds u16".into()));
+            }
+            let mbuf = allocate_mbuf(self.mempool, len)?;
+            let data = unsafe { rte_pktmbuf_append(mbuf, len as u16) };
+            if data.is_null() {
+                unsafe { rte_pktmbuf_free(mbuf) };
+                return Err(DpdkError::Backend("mbuf append failed".into()));
+            }
+            Ok(DpdkTxLease {
+                dataplane: self,
+                mbuf,
+                data: data as *mut u8,
+                capacity: len,
+                state: TxLeaseState::Held,
+            })
+        }
+
         pub fn send_frame(&mut self, frame: &DpdkFrame<'_>) -> Result<(), DpdkError> {
             let mbuf = frame.mbuf;
             self.tx_buf[0] = mbuf;
@@ -552,20 +611,9 @@ mod linux {
         }
 
         pub fn send_bytes(&mut self, data: &[u8]) -> Result<(), DpdkError> {
-            let mbuf = allocate_mbuf(self.mempool, data.len())?;
-            let rc = unsafe { aegis_dpdk_mbuf_write(mbuf, data.as_ptr(), data.len() as u16) };
-            if rc != 0 {
-                unsafe { rte_pktmbuf_free(mbuf) };
-                return Err(DpdkError::Backend("mbuf write failed".into()));
-            }
-            let frame = DpdkFrame {
-                mbuf,
-                data: data.as_ptr(),
-                len: data.len(),
-                sent: Cell::new(false),
-                _marker: PhantomData,
-            };
-            self.send_frame(&frame)
+            let mut lease = self.lease_tx(data.len())?;
+            lease.buffer().copy_from_slice(data);
+            lease.commit(data.len())
         }
 
         pub fn stats(&mut self) -> Result<DpdkStats, DpdkError> {
@@ -676,6 +724,59 @@ mod linux {
                 len,
                 sent: Cell::new(false),
                 _marker: PhantomData,
+            }
+        }
+    }
+
+    impl DpdkTxLease<'_> {
+        pub fn buffer(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.data, self.capacity) }
+        }
+
+        pub fn commit(mut self, len: usize) -> Result<(), DpdkError> {
+            if self.state != TxLeaseState::Held {
+                return Err(DpdkError::Backend("tx lease already used".into()));
+            }
+            if len == 0 || len > self.capacity {
+                self.state = TxLeaseState::Released;
+                unsafe { rte_pktmbuf_free(self.mbuf) };
+                return Err(DpdkError::Config("tx length out of range".into()));
+            }
+            if len < self.capacity {
+                let trim = (self.capacity - len) as u16;
+                let rc = unsafe { rte_pktmbuf_trim(self.mbuf, trim) };
+                if rc != 0 {
+                    self.state = TxLeaseState::Released;
+                    unsafe { rte_pktmbuf_free(self.mbuf) };
+                    return Err(dpdk_err("mbuf trim"));
+                }
+            }
+
+            self.dataplane.tx_buf[0] = self.mbuf;
+            let sent = unsafe {
+                rte_eth_tx_burst(
+                    self.dataplane.port_id,
+                    self.dataplane.tx_queue,
+                    self.dataplane.tx_buf.as_mut_ptr(),
+                    1,
+                )
+            };
+            if sent == 1 {
+                self.dataplane.tx_count = self.dataplane.tx_count.wrapping_add(1);
+                self.state = TxLeaseState::Submitted;
+                Ok(())
+            } else {
+                self.state = TxLeaseState::Released;
+                unsafe { rte_pktmbuf_free(self.mbuf) };
+                Err(DpdkError::Backend("tx burst dropped".into()))
+            }
+        }
+    }
+
+    impl Drop for DpdkTxLease<'_> {
+        fn drop(&mut self) {
+            if self.state == TxLeaseState::Held {
+                unsafe { rte_pktmbuf_free(self.mbuf) };
             }
         }
     }
@@ -1000,7 +1101,7 @@ mod linux {
 }
 
 #[cfg(all(feature = "dpdk", target_os = "linux"))]
-pub use linux::{DpdkDataplane, DpdkFrame};
+pub use linux::{DpdkDataplane, DpdkFrame, DpdkTxLease};
 
 #[cfg(test)]
 mod tests {

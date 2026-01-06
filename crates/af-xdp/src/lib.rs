@@ -81,9 +81,25 @@ mod stub {
         data: &'a [u8],
     }
 
+    #[derive(Debug)]
+    pub struct AfXdpTxLease<'a> {
+        buf: [u8; 0],
+        _marker: std::marker::PhantomData<&'a mut ()>,
+    }
+
     impl AfXdpFrame<'_> {
         pub fn bytes(&self) -> &[u8] {
             self.data
+        }
+    }
+
+    impl AfXdpTxLease<'_> {
+        pub fn buffer(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        pub fn commit(self, _len: usize) -> Result<(), AfXdpError> {
+            Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
         }
     }
 
@@ -123,6 +139,10 @@ mod stub {
             Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
         }
 
+        pub fn lease_tx(&mut self, _len: usize) -> Result<AfXdpTxLease<'_>, AfXdpError> {
+            Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
+        }
+
         pub fn stats(&mut self) -> Result<super::AfXdpStats, AfXdpError> {
             Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
         }
@@ -147,7 +167,10 @@ mod stub {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub use stub::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode, ensure_pinned_xdp_program};
+pub use stub::{
+    AfXdpDataplane, AfXdpFrame, AfXdpTxLease, XdpAttachFlags, XdpAttachMode,
+    ensure_pinned_xdp_program,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -525,6 +548,7 @@ impl AfXdpFrame<'_> {
 struct Umem {
     base: *mut u8,
     len: usize,
+    frame_size: usize,
     headroom: usize,
     hugepages: bool,
     numa_node: Option<i32>,
@@ -565,6 +589,21 @@ pub struct AfXdpDataplane {
     last_rx_addr: Option<u64>,
     rx_count: u64,
     tx_count: u64,
+}
+
+#[derive(Debug)]
+pub struct AfXdpTxLease<'a> {
+    dataplane: &'a mut AfXdpDataplane,
+    addr: u64,
+    capacity: usize,
+    state: TxLeaseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxLeaseState {
+    Held,
+    Submitted,
+    Released,
 }
 
 impl AfXdpDataplane {
@@ -679,6 +718,7 @@ impl AfXdpDataplane {
         let mut umem = Umem {
             base: umem_base,
             len: umem_len,
+            frame_size,
             headroom,
             hugepages: umem_hugepages,
             numa_node: umem_numa_node,
@@ -894,53 +934,32 @@ impl AfXdpDataplane {
         Ok(Some(AfXdpFrame { data }))
     }
 
-    pub fn send_frame(&mut self, frame: &AfXdpFrame<'_>) -> Result<(), AfXdpError> {
+    pub fn lease_tx(&mut self, len: usize) -> Result<AfXdpTxLease<'_>, AfXdpError> {
+        if len == 0 {
+            return Err(AfXdpError::Config("tx length must be > 0".into()));
+        }
+        let max_len = self.umem.frame_size.saturating_sub(self.umem.headroom);
+        if len > max_len {
+            return Err(AfXdpError::Config("tx length exceeds umem frame".into()));
+        }
         self.reclaim_completed();
         let addr = self
             .umem
             .free_list
             .pop()
             .ok_or_else(|| AfXdpError::Backend("no free umem frames".into()))?;
-        let start = addr as usize + self.umem.headroom;
-        let end = start + frame.data.len();
-        if end > self.umem.len {
-            self.umem.free_list.push(addr);
-            return Err(AfXdpError::Backend("frame too large for umem".into()));
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(
-                frame.data.as_ptr(),
-                self.umem.base.add(start),
-                frame.data.len(),
-            );
-        }
+        Ok(AfXdpTxLease {
+            dataplane: self,
+            addr,
+            capacity: len,
+            state: TxLeaseState::Held,
+        })
+    }
 
-        let mut prod = unsafe { ptr::read_volatile(self.tx.producer) };
-        let cons = unsafe { ptr::read_volatile(self.tx.consumer) };
-        if prod.wrapping_sub(cons) >= self.tx.size {
-            self.umem.free_list.push(addr);
-            return Err(AfXdpError::Backend("tx ring full".into()));
-        }
-        let idx = (prod & self.tx.mask) as isize;
-        let desc = XdpDesc {
-            addr: addr + self.umem.headroom as u64,
-            len: frame.data.len() as u32,
-            options: 0,
-        };
-        unsafe {
-            ptr::write_volatile(self.tx.desc.offset(idx), desc);
-        }
-        prod = prod.wrapping_add(1);
-        unsafe {
-            ptr::write_volatile(self.tx.producer, prod);
-        }
-        fence(Ordering::Release);
-
-        if self.need_wakeup && Self::should_wakeup(&self.tx) {
-            self.kick_tx();
-        }
-        self.tx_count = self.tx_count.wrapping_add(1);
-        Ok(())
+    pub fn send_frame(&mut self, frame: &AfXdpFrame<'_>) -> Result<(), AfXdpError> {
+        let mut lease = self.lease_tx(frame.data.len())?;
+        lease.buffer().copy_from_slice(frame.data);
+        lease.commit(frame.data.len())
     }
 
     pub fn stats(&mut self) -> Result<AfXdpStats, AfXdpError> {
@@ -1018,6 +1037,61 @@ impl Umem {
         }
         fence(Ordering::Release);
         Ok(())
+    }
+}
+
+impl AfXdpTxLease<'_> {
+    pub fn buffer(&mut self) -> &mut [u8] {
+        let start = self.addr as usize + self.dataplane.umem.headroom;
+        unsafe { slice::from_raw_parts_mut(self.dataplane.umem.base.add(start), self.capacity) }
+    }
+
+    pub fn commit(mut self, len: usize) -> Result<(), AfXdpError> {
+        if self.state != TxLeaseState::Held {
+            return Err(AfXdpError::Backend("tx lease already used".into()));
+        }
+        if len == 0 || len > self.capacity {
+            self.state = TxLeaseState::Released;
+            self.dataplane.umem.free_list.push(self.addr);
+            return Err(AfXdpError::Config("tx length out of range".into()));
+        }
+
+        let mut prod = unsafe { ptr::read_volatile(self.dataplane.tx.producer) };
+        let cons = unsafe { ptr::read_volatile(self.dataplane.tx.consumer) };
+        if prod.wrapping_sub(cons) >= self.dataplane.tx.size {
+            self.state = TxLeaseState::Released;
+            self.dataplane.umem.free_list.push(self.addr);
+            return Err(AfXdpError::Backend("tx ring full".into()));
+        }
+        let idx = (prod & self.dataplane.tx.mask) as isize;
+        let desc = XdpDesc {
+            addr: self.addr + self.dataplane.umem.headroom as u64,
+            len: len as u32,
+            options: 0,
+        };
+        unsafe {
+            ptr::write_volatile(self.dataplane.tx.desc.offset(idx), desc);
+        }
+        prod = prod.wrapping_add(1);
+        unsafe {
+            ptr::write_volatile(self.dataplane.tx.producer, prod);
+        }
+        fence(Ordering::Release);
+
+        if self.dataplane.need_wakeup && AfXdpDataplane::should_wakeup(&self.dataplane.tx) {
+            self.dataplane.kick_tx();
+        }
+        self.dataplane.tx_count = self.dataplane.tx_count.wrapping_add(1);
+        self.state = TxLeaseState::Submitted;
+        Ok(())
+    }
+}
+
+impl Drop for AfXdpTxLease<'_> {
+    fn drop(&mut self) {
+        if self.state == TxLeaseState::Held {
+            self.dataplane.umem.free_list.push(self.addr);
+        }
     }
 }
 
@@ -1353,6 +1427,7 @@ mod tests {
         let mut umem = Umem {
             base: ptr::null_mut(),
             len: 0,
+            frame_size: 2048,
             headroom: 256,
             hugepages: false,
             numa_node: None,
@@ -1409,4 +1484,7 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode, ensure_pinned_xdp_program};
+pub use linux::{
+    AfXdpDataplane, AfXdpFrame, AfXdpTxLease, XdpAttachFlags, XdpAttachMode,
+    ensure_pinned_xdp_program,
+};

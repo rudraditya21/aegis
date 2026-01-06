@@ -163,6 +163,7 @@ Operational tuning:
 - `rss.*` aligns flow distribution with RX queues and CPU affinity.
 - `flow-shards` should match worker count for per-core isolation.
 - Use `dataplane-diag` and `metrics --iface` to verify hugepage/NUMA readiness and zero-copy support.
+- For zero-copy TX, lease buffers via the dataplane `lease_tx` API; `send_frame` remains a safe copy-based fallback.
 
 ## Implemented Features
 
