@@ -71,7 +71,7 @@ pub struct PinnedXdp {
 
 #[cfg(not(target_os = "linux"))]
 mod stub {
-    use super::{AfXdpConfig, AfXdpError};
+    use super::{AfXdpConfig, AfXdpError, PinnedXdp};
 
     #[derive(Debug)]
     pub struct AfXdpDataplane;
@@ -135,10 +135,19 @@ mod stub {
             0
         }
     }
+
+    pub fn ensure_pinned_xdp_program(
+        _pin_dir: &std::path::Path,
+        _program_name: &str,
+        _map_name: &str,
+        _max_entries: u32,
+    ) -> Result<PinnedXdp, AfXdpError> {
+        Err(AfXdpError::Unsupported("af-xdp only supported on linux"))
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub use stub::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode};
+pub use stub::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode, ensure_pinned_xdp_program};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -1404,4 +1413,4 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode};
+pub use linux::{AfXdpDataplane, AfXdpFrame, XdpAttachFlags, XdpAttachMode, ensure_pinned_xdp_program};

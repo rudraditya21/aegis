@@ -113,6 +113,28 @@ spawns queue-affine workers; for pcap it uses software hashing to shard flows ac
 - Per-core worker balance (live traffic): `cargo run -p aegis -- capture --rules /etc/aegis/rules/l3l4.rules --iface eth0 --count 10000 --worker-stats`
 - CI build matrix: `.github/workflows/ci.yml` builds `pcap`, `af-xdp`, and `dpdk` on Linux.
 
+### Docker Test Runs
+
+CI container (AF_XDP/DPDK feature tests):
+```bash
+docker build -f docker/Dockerfile.ci -t aegis-ci .
+docker run --rm -v "$PWD:/workspace" -w /workspace aegis-ci bash docker/run_ci_tests.sh af-xdp
+docker run --rm -v "$PWD:/workspace" -w /workspace aegis-ci bash docker/run_ci_tests.sh dpdk
+```
+
+Runtime images (multi-distro Linux):
+```bash
+bash docker/build-matrix.sh
+docker run --rm -it aegis:debian --help
+```
+
+PCAP-only tests (host):
+```bash
+cargo test -p aegis-core
+cargo test -p aegis-dataplane --features pcap
+cargo test -p aegis --features pcap
+```
+
 ### Rule File Format
 
 One rule per line (`#` for comments):

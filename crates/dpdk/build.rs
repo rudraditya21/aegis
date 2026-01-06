@@ -13,5 +13,9 @@ fn main() {
     for inc in lib.include_paths {
         build.include(inc);
     }
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if arch == "x86_64" || arch == "x86" {
+        build.flag_if_supported("-mssse3");
+    }
     build.compile("aegis_dpdk_shim");
 }

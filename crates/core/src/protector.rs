@@ -92,14 +92,12 @@ impl AttackProtector {
 
     pub fn check(&mut self, meta: &PacketMetadata, flow: &FlowOutcome, now: Instant) -> bool {
         if meta.protocol == IpProtocol::Tcp {
-            if let Some(flags) = meta.tcp_flags
-                && {
-                    let syn = flags & 0x02 != 0;
-                    let ack = flags & 0x10 != 0;
-                    ack && !syn && flow.is_new && flow.previous_state.is_none()
+            if let Some(flags) = meta.tcp_flags {
+                let syn = flags & 0x02 != 0;
+                let ack = flags & 0x10 != 0;
+                if ack && !syn && flow.is_new && flow.previous_state.is_none() {
+                    return false;
                 }
-            {
-                return false;
             }
         }
 
@@ -117,14 +115,15 @@ impl AttackProtector {
                 }
             }
             if matches!(flow.state, FlowState::Established) {
-                if let Some(prev) = flow.previous_state
-                    && matches!(
+                if let Some(prev) = flow.previous_state {
+                    if matches!(
                         prev,
                         FlowState::SynSent | FlowState::SynReceived | FlowState::New
-                    )
-                    && let Some(counter) = self.syn_counters.get_mut(&meta.src_ip)
-                {
-                    counter.decay(1);
+                    ) {
+                        if let Some(counter) = self.syn_counters.get_mut(&meta.src_ip) {
+                            counter.decay(1);
+                        }
+                    }
                 }
             }
         }

@@ -156,10 +156,10 @@ impl SignatureEngine {
     pub fn scan_exploits(&self, payload: &[u8]) -> Vec<String> {
         let mut hits = Vec::new();
         for mat in self.exploits.find_iter(payload) {
-            if let Some(label) = self.exploit_labels.get(mat.pattern().as_usize())
-                && !hits.iter().any(|h: &String| h == label)
-            {
-                hits.push((*label).to_string());
+            if let Some(label) = self.exploit_labels.get(mat.pattern().as_usize()) {
+                if !hits.iter().any(|h: &String| h == label) {
+                    hits.push((*label).to_string());
+                }
             }
         }
         hits

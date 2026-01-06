@@ -1,0 +1,15 @@
+FROM rust:1.85.0-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    build-essential \
+    pkg-config \
+    libpcap-dev \
+    libdpdk-dev \
+    clang \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --uid 1000 --create-home runner
+USER runner
+WORKDIR /workspace

@@ -47,15 +47,15 @@ impl TcpStreamState {
         let mut data = payload.to_vec();
 
         // If this overlaps already delivered region, trim
-        if let Some(expected) = self.next_seq
-            && seq < expected
-        {
-            let overlap = (expected - seq) as usize;
-            if overlap >= data.len() {
-                return (Vec::new(), false);
+        if let Some(expected) = self.next_seq {
+            if seq < expected {
+                let overlap = (expected - seq) as usize;
+                if overlap >= data.len() {
+                    return (Vec::new(), false);
+                }
+                data.drain(0..overlap);
+                start = expected;
             }
-            data.drain(0..overlap);
-            start = expected;
         }
 
         if let Some(expected) = self.next_seq {
@@ -160,15 +160,15 @@ impl PolicyCondition {
         geo_enabled: bool,
         time_enabled: bool,
     ) -> bool {
-        if let Some(src) = &self.src
-            && !src.contains(&meta.src_ip)
-        {
-            return false;
+        if let Some(src) = &self.src {
+            if !src.contains(&meta.src_ip) {
+                return false;
+            }
         }
-        if let Some(dst) = &self.dst
-            && !dst.contains(&meta.dst_ip)
-        {
-            return false;
+        if let Some(dst) = &self.dst {
+            if !dst.contains(&meta.dst_ip) {
+                return false;
+            }
         }
         if !self.users.is_empty() {
             match &meta.user {
@@ -721,33 +721,33 @@ impl Firewall {
             }
         }
 
-        if let Some((action, dir)) = self.proto_rules.get(&packet.protocol)
-            && *dir == packet.direction
-        {
-            if *action == Action::Deny {
-                return Action::Deny;
+        if let Some((action, dir)) = self.proto_rules.get(&packet.protocol) {
+            if *dir == packet.direction {
+                if *action == Action::Deny {
+                    return Action::Deny;
+                }
+                decision.get_or_insert(action.clone());
             }
-            decision.get_or_insert(action.clone());
         }
 
         if let Some(action) = decision {
             return action;
         }
 
-        if let Some((action, dir)) = &self.default
-            && *dir == packet.direction
-        {
-            return action.clone();
+        if let Some((action, dir)) = &self.default {
+            if *dir == packet.direction {
+                return action.clone();
+            }
         }
 
         Action::Deny
     }
 
     fn match_port(&self, proto: IpProtocol, port: u16, direction: Direction) -> Option<Action> {
-        if let Some((action, dir)) = self.port_rules.get(&(proto, port))
-            && *dir == direction
-        {
-            return Some(action.clone());
+        if let Some((action, dir)) = self.port_rules.get(&(proto, port)) {
+            if *dir == direction {
+                return Some(action.clone());
+            }
         }
         for (p, range, action, dir) in &self.port_ranges {
             if *p == proto && range.contains(port) && *dir == direction {

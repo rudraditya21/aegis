@@ -281,6 +281,10 @@ mod linux {
         hugepages: bool,
     }
 
+    // DPDK mempool pointers are thread-safe; PortState is immutable after init.
+    unsafe impl Send for PortState {}
+    unsafe impl Sync for PortState {}
+
     #[derive(Debug)]
     struct EalState {
         args: Vec<String>,
@@ -321,7 +325,7 @@ mod linux {
         }
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn rte_eal_init(argc: c_int, argv: *mut *mut c_char) -> c_int;
         fn rte_socket_id() -> c_int;
         fn rte_eth_dev_count_avail() -> u16;
@@ -349,11 +353,10 @@ mod linux {
             socket_id: c_int,
         ) -> *mut rte_mempool;
         fn rte_pktmbuf_free(m: *mut rte_mbuf);
-        static mut rte_errno: c_int;
         fn rte_strerror(errnum: c_int) -> *const c_char;
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn aegis_dpdk_port_configure(port_id: u16, rxq: u16, txq: u16) -> c_int;
         fn aegis_dpdk_rx_queue_setup(
             port_id: u16,
@@ -383,6 +386,7 @@ mod linux {
             queues: *const u16,
             queue_len: u16,
         ) -> c_int;
+        fn aegis_dpdk_errno() -> c_int;
     }
 
     #[derive(Debug)]
@@ -536,12 +540,12 @@ mod linux {
             for i in 0..nb {
                 let mbuf = self.rx_buf[i as usize];
                 if i == 0 {
-                    first = Some(self.wrap_mbuf(mbuf));
+                    first = Some(mbuf);
                 } else {
                     self.rx_cache.push(mbuf);
                 }
             }
-            Ok(first)
+            Ok(first.map(|mbuf| self.wrap_mbuf(mbuf)))
         }
 
         pub fn send_frame(&mut self, frame: &DpdkFrame<'_>) -> Result<(), DpdkError> {
@@ -634,7 +638,7 @@ mod linux {
             }
 
             let key_len = if info.hash_key_size == 0 {
-                DEFAULT_RSS_KEY_LEN
+                super::DEFAULT_RSS_KEY_LEN
             } else {
                 info.hash_key_size as usize
             };
@@ -736,7 +740,7 @@ mod linux {
             return Ok(state);
         }
 
-        let config = desired;
+        let config = desired.clone();
         let mut mempools = Vec::with_capacity(config.rx_queues as usize);
         for q in 0..config.rx_queues {
             let socket_id = *config
@@ -982,7 +986,7 @@ mod linux {
 
     fn allocate_mbuf(pool: *mut rte_mempool, len: usize) -> Result<*mut rte_mbuf, DpdkError> {
         let _ = len;
-        extern "C" {
+        unsafe extern "C" {
             fn rte_pktmbuf_alloc(pool: *mut rte_mempool) -> *mut rte_mbuf;
         }
         let mbuf = unsafe { rte_pktmbuf_alloc(pool) };
@@ -993,7 +997,7 @@ mod linux {
     }
 
     fn dpdk_err(ctx: &str) -> DpdkError {
-        let err = unsafe { rte_errno };
+        let err = unsafe { aegis_dpdk_errno() };
         let msg = unsafe {
             let cstr = rte_strerror(err);
             if cstr.is_null() {
@@ -1008,7 +1012,7 @@ mod linux {
 }
 
 #[cfg(all(feature = "dpdk", target_os = "linux"))]
-pub use linux::{DpdkDataplane, DpdkFrame, DpdkStats};
+pub use linux::{DpdkDataplane, DpdkFrame};
 
 #[cfg(test)]
 mod tests {

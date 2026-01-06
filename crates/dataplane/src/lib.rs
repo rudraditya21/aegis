@@ -405,7 +405,7 @@ impl DataplaneHandle {
                         hugepage_fallback: af_cfg.hugepage_fallback,
                         numa_fallback: af_cfg.numa_fallback,
                     };
-                    let mut dp = AfXdpDataplane::open_live(iface, &inner_cfg).map_err(|e| {
+                    let dp = AfXdpDataplane::open_live(iface, &inner_cfg).map_err(|e| {
                         DataplaneError::Backend(format!("af-xdp init: {e}"))
                     })?;
                     if let Some(map_pin) = map_pin.as_deref() {
@@ -502,12 +502,10 @@ impl Dataplane for DataplaneHandle {
                 .next_frame()
                 .map(|opt| opt.map(AnyFrame::Pcap)),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
-            DataplaneHandle::AfXdp(dp) => dp
-                .next_frame()
+            DataplaneHandle::AfXdp(dp) => <AfXdpDataplane as Dataplane>::next_frame(dp)
                 .map(|opt| opt.map(AnyFrame::AfXdp)),
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
-            DataplaneHandle::Dpdk(dp) => dp
-                .next_frame()
+            DataplaneHandle::Dpdk(dp) => <DpdkDataplane as Dataplane>::next_frame(dp)
                 .map(|opt| opt.map(AnyFrame::Dpdk)),
         }
     }
@@ -517,15 +515,16 @@ impl Dataplane for DataplaneHandle {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => match frame {
                 AnyFrame::Pcap(frame) => dp.send_frame(frame),
+                _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             DataplaneHandle::AfXdp(dp) => match frame {
-                AnyFrame::AfXdp(frame) => dp.send_frame(frame),
+                AnyFrame::AfXdp(frame) => <AfXdpDataplane as Dataplane>::send_frame(dp, frame),
                 _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
             DataplaneHandle::Dpdk(dp) => match frame {
-                AnyFrame::Dpdk(frame) => dp.send_frame(frame),
+                AnyFrame::Dpdk(frame) => <DpdkDataplane as Dataplane>::send_frame(dp, frame),
                 _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
         }
@@ -536,9 +535,9 @@ impl Dataplane for DataplaneHandle {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => dp.stats(),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
-            DataplaneHandle::AfXdp(dp) => dp.stats(),
+            DataplaneHandle::AfXdp(dp) => <AfXdpDataplane as Dataplane>::stats(dp),
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
-            DataplaneHandle::Dpdk(dp) => dp.stats(),
+            DataplaneHandle::Dpdk(dp) => <DpdkDataplane as Dataplane>::stats(dp),
         }
     }
 
@@ -547,9 +546,9 @@ impl Dataplane for DataplaneHandle {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => dp.configure_rss(rss),
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
-            DataplaneHandle::AfXdp(dp) => dp.configure_rss(rss),
+            DataplaneHandle::AfXdp(dp) => <AfXdpDataplane as Dataplane>::configure_rss(dp, rss),
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
-            DataplaneHandle::Dpdk(dp) => dp.configure_rss(rss),
+            DataplaneHandle::Dpdk(dp) => <DpdkDataplane as Dataplane>::configure_rss(dp, rss),
         }
     }
 
@@ -625,6 +624,7 @@ mod tests {
         let err = DataplaneHandle::open_live("eth0", &cfg).unwrap_err();
         match err {
             DataplaneError::Unsupported(_) => {}
+            DataplaneError::Backend(_) => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }

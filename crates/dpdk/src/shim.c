@@ -178,3 +178,7 @@ int aegis_dpdk_rss_configure(uint16_t port_id,
     }
     return 0;
 }
+
+int aegis_dpdk_errno(void) {
+    return rte_errno;
+}

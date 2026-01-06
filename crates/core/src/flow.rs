@@ -233,12 +233,12 @@ impl FlowShard {
         tls: Option<TlsMetadata>,
         now: Instant,
     ) {
-        if self.table.len() >= self.capacity
-            && let Some(oldest) = self.lru.pop_front()
-        {
-            self.table.remove(&oldest);
-            self.stats.add_evicted();
-            self.last_evicted = Some(oldest);
+        if self.table.len() >= self.capacity {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.table.remove(&oldest);
+                self.stats.add_evicted();
+                self.last_evicted = Some(oldest);
+            }
         }
         self.lru.push_back(key);
         self.table.insert(
