@@ -1078,13 +1078,29 @@ pub struct FirewallManager {
 
 impl FirewallManager {
     pub fn new(flow_capacity: usize) -> Self {
-        Self::with_log_capacity(flow_capacity, 1024)
+        Self::with_log_capacity_and_shards(flow_capacity, 1024, None)
     }
 
     pub fn with_log_capacity(flow_capacity: usize, log_capacity: usize) -> Self {
+        Self::with_log_capacity_and_shards(flow_capacity, log_capacity, None)
+    }
+
+    pub fn with_flow_shards(flow_capacity: usize, flow_shards: usize) -> Self {
+        Self::with_log_capacity_and_shards(flow_capacity, 1024, Some(flow_shards))
+    }
+
+    pub fn with_log_capacity_and_shards(
+        flow_capacity: usize,
+        log_capacity: usize,
+        flow_shards: Option<usize>,
+    ) -> Self {
+        let flows = match flow_shards {
+            Some(shards) => FlowTable::with_shards(flow_capacity, shards),
+            None => FlowTable::new(flow_capacity),
+        };
         FirewallManager {
             firewall: Firewall::new(),
-            flows: FlowTable::new(flow_capacity),
+            flows,
             protector: AttackProtector::new(),
             behavior: BehaviorDetector::new(),
             signature_engine: SignatureEngine::with_default_rules(),
@@ -2121,7 +2137,7 @@ mod tests {
 
     #[test]
     fn regression_lru_retains_recent_flow() {
-        let mut table = FlowTable::new(2);
+        let mut table = FlowTable::with_shards(2, 1);
         let now = Instant::now();
         let a = meta("10.0.0.1", IpProtocol::Udp, Some(1), Some(2), None);
         let b = meta("10.0.0.2", IpProtocol::Udp, Some(3), Some(4), None);

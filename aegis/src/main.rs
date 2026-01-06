@@ -34,6 +34,7 @@ use rss::FlowSharder;
 #[derive(Debug, Clone)]
 struct Tuning {
     flow_capacity: usize,
+    flow_shards: Option<usize>,
     reassembly_buffer: usize,
     signature_tail_budget: usize,
     backpressure_mode: BackpressureMode,
@@ -45,6 +46,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Tuning {
             flow_capacity: 65_535,
+            flow_shards: None,
             reassembly_buffer: 4096,
             signature_tail_budget: 64 * 1024,
             backpressure_mode: BackpressureMode::Drop,
@@ -290,6 +292,11 @@ fn cmd_eval(args: Vec<String>) -> Result<(), String> {
                     tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
                 }
             }
+            "--flow-shards" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_shards = Some(v.parse().map_err(|_| "invalid flow shards")?);
+                }
+            }
             "--reassembly-buffer" => {
                 if let Some(v) = iter.next() {
                     tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
@@ -448,6 +455,11 @@ fn cmd_eval_batch(args: Vec<String>) -> Result<(), String> {
                     tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
                 }
             }
+            "--flow-shards" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_shards = Some(v.parse().map_err(|_| "invalid flow shards")?);
+                }
+            }
             "--reassembly-buffer" => {
                 if let Some(v) = iter.next() {
                     tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
@@ -583,6 +595,11 @@ fn cmd_capture(args: Vec<String>) -> Result<(), String> {
             "--flow-capacity" => {
                 if let Some(v) = iter.next() {
                     tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--flow-shards" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_shards = Some(v.parse().map_err(|_| "invalid flow shards")?);
                 }
             }
             "--reassembly-buffer" => {
@@ -722,6 +739,11 @@ fn cmd_capture_async(args: Vec<String>) -> Result<(), String> {
             "--flow-capacity" => {
                 if let Some(v) = iter.next() {
                     tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
+                }
+            }
+            "--flow-shards" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_shards = Some(v.parse().map_err(|_| "invalid flow shards")?);
                 }
             }
             "--reassembly-buffer" => {
@@ -1382,6 +1404,11 @@ fn cmd_replay(args: Vec<String>) -> Result<(), String> {
                     tuning.flow_capacity = v.parse().map_err(|_| "invalid flow capacity")?;
                 }
             }
+            "--flow-shards" => {
+                if let Some(v) = iter.next() {
+                    tuning.flow_shards = Some(v.parse().map_err(|_| "invalid flow shards")?);
+                }
+            }
             "--reassembly-buffer" => {
                 if let Some(v) = iter.next() {
                     tuning.reassembly_buffer = v.parse().map_err(|_| "invalid reassembly buffer")?;
@@ -1598,7 +1625,11 @@ fn load_manager(
         parsed_rules.push(rule);
     }
     validate_rules(&parsed_rules)?;
-    let mut mgr = FirewallManager::new(tuning.flow_capacity);
+    let mut mgr = if let Some(shards) = tuning.flow_shards {
+        FirewallManager::with_flow_shards(tuning.flow_capacity, shards)
+    } else {
+        FirewallManager::new(tuning.flow_capacity)
+    };
     for rule in parsed_rules {
         mgr.add_rule(rule);
     }
@@ -1637,7 +1668,11 @@ fn load_manager_from_lines(
         parsed_rules.push(rule);
     }
     validate_rules(&parsed_rules)?;
-    let mut mgr = FirewallManager::new(tuning.flow_capacity);
+    let mut mgr = if let Some(shards) = tuning.flow_shards {
+        FirewallManager::with_flow_shards(tuning.flow_capacity, shards)
+    } else {
+        FirewallManager::new(tuning.flow_capacity)
+    };
     for rule in parsed_rules {
         mgr.add_rule(rule);
     }

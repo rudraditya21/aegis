@@ -88,50 +88,45 @@ struct FlowEntry {
     tls: Option<TlsMetadata>,
 }
 
-#[derive(Debug)]
-pub struct FlowTable {
-    capacity: usize,
-    lru: VecDeque<FlowKey>,
-    table: HashMap<FlowKey, FlowEntry>,
-    stats: Vec<FlowStats>,
+#[derive(Debug, Clone, Copy)]
+struct FlowTimeouts {
     handshake_timeout: Duration,
     established_timeout: Duration,
     closed_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct FlowShard {
+    capacity: usize,
+    lru: VecDeque<FlowKey>,
+    table: HashMap<FlowKey, FlowEntry>,
+    stats: FlowStats,
     last_evicted: Option<FlowKey>,
 }
 
-impl FlowTable {
-    pub fn new(capacity: usize) -> Self {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        FlowTable {
+impl FlowShard {
+    fn new(capacity: usize) -> Self {
+        FlowShard {
             capacity: capacity.max(1),
             lru: VecDeque::new(),
             table: HashMap::new(),
-            stats: vec![
-                FlowStats {
-                    packets: 0,
-                    new_flows: 0,
-                    evicted: 0,
-                };
-                cores
-            ],
-            handshake_timeout: Duration::from_secs(30),
-            established_timeout: Duration::from_secs(300),
-            closed_timeout: Duration::from_secs(15),
+            stats: FlowStats::default(),
             last_evicted: None,
         }
     }
 
-    pub fn observe(&mut self, meta: &PacketMetadata, now: Instant) -> FlowOutcome {
-        let key = FlowKey::from_metadata(meta);
-        let cpu = self.cpu_index();
-        self.reap_expired(now);
-        self.bump_packet(cpu);
+    fn observe(
+        &mut self,
+        key: FlowKey,
+        meta: &PacketMetadata,
+        now: Instant,
+        timeouts: &FlowTimeouts,
+    ) -> FlowOutcome {
+        self.reap_expired(now, timeouts);
+        self.stats.add_packet();
 
         if let Some(entry) = self.table.get(&key).cloned() {
-            if is_expired(entry.state, entry.last_seen, now, self) {
+            if is_expired(entry.state, entry.last_seen, now, timeouts) {
                 self.remove_entry(&key);
             } else {
                 let new_state = advance_state(entry.state, meta.tcp_flags);
@@ -155,8 +150,8 @@ impl FlowTable {
         }
 
         let initial = initial_state(meta.protocol, meta.tcp_flags);
-        self.insert_new(key, initial, meta.application, meta.tls.clone(), now, cpu);
-        self.bump_new_flow(cpu);
+        self.insert_new(key, initial, meta.application, meta.tls.clone(), now);
+        self.stats.add_flow();
         FlowOutcome {
             is_new: true,
             state: initial,
@@ -166,21 +161,11 @@ impl FlowTable {
         }
     }
 
-    pub fn stats(&self) -> FlowStats {
-        let mut agg = FlowStats {
-            packets: 0,
-            new_flows: 0,
-            evicted: 0,
-        };
-        for s in &self.stats {
-            agg.packets += s.packets;
-            agg.new_flows += s.new_flows;
-            agg.evicted += s.evicted;
-        }
-        agg
+    fn stats(&self) -> FlowStats {
+        self.stats
     }
 
-    pub fn set_capacity(&mut self, new_capacity: usize) {
+    fn set_capacity(&mut self, new_capacity: usize) {
         let new_capacity = new_capacity.max(1);
         while self.table.len() > new_capacity {
             if let Some(oldest) = self.lru.pop_front() {
@@ -192,19 +177,15 @@ impl FlowTable {
         self.capacity = new_capacity;
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.table.len()
     }
 
-    pub fn contains(&self, key: &FlowKey) -> bool {
+    fn contains(&self, key: &FlowKey) -> bool {
         self.table.contains_key(key)
     }
 
-    pub fn snapshot(&self) -> Vec<FlowSnapshot> {
+    fn snapshot(&self) -> Vec<FlowSnapshot> {
         self.lru
             .iter()
             .filter_map(|k| {
@@ -219,35 +200,21 @@ impl FlowTable {
             .collect()
     }
 
-    pub fn export_state(&self) -> FlowSyncState {
-        FlowSyncState {
-            flows: self.snapshot(),
-            stats: self.stats(),
-        }
+    fn import_snapshot(&mut self, snap: &FlowSnapshot) {
+        self.insert_or_replace_with_last_seen(
+            snap.key,
+            snap.state,
+            snap.application,
+            snap.tls.clone(),
+            snap.last_seen,
+        );
     }
 
-    pub fn import_state(&mut self, state: &FlowSyncState, now: Instant) {
-        for snap in &state.flows {
-            self.insert_or_replace(
-                snap.key,
-                snap.state,
-                snap.application,
-                snap.tls.clone(),
-                now,
-            );
-        }
-        if let Some(stat) = self.stats.get_mut(0) {
-            stat.packets = stat.packets.max(state.stats.packets);
-            stat.new_flows = stat.new_flows.max(state.stats.new_flows);
-            stat.evicted = stat.evicted.max(state.stats.evicted);
-        }
-    }
-
-    pub fn reap_expired(&mut self, now: Instant) -> usize {
+    fn reap_expired(&mut self, now: Instant, timeouts: &FlowTimeouts) -> usize {
         let mut removed = 0usize;
         let mut to_remove = Vec::new();
         for (key, entry) in self.table.iter() {
-            if is_expired(entry.state, entry.last_seen, now, self) {
+            if is_expired(entry.state, entry.last_seen, now, timeouts) {
                 to_remove.push(*key);
             }
         }
@@ -265,13 +232,12 @@ impl FlowTable {
         application: ApplicationType,
         tls: Option<TlsMetadata>,
         now: Instant,
-        cpu: usize,
     ) {
         if self.table.len() >= self.capacity
             && let Some(oldest) = self.lru.pop_front()
         {
             self.table.remove(&oldest);
-            self.bump_evicted(cpu);
+            self.stats.add_evicted();
             self.last_evicted = Some(oldest);
         }
         self.lru.push_back(key);
@@ -286,25 +252,24 @@ impl FlowTable {
         );
     }
 
-    fn insert_or_replace(
+    fn insert_or_replace_with_last_seen(
         &mut self,
         key: FlowKey,
         state: FlowState,
         application: ApplicationType,
         tls: Option<TlsMetadata>,
-        now: Instant,
+        last_seen: Instant,
     ) {
         if self.table.contains_key(&key) {
             if let Some(entry) = self.table.get_mut(&key) {
                 entry.state = state;
-                entry.last_seen = now;
+                entry.last_seen = last_seen;
                 entry.application = application;
                 entry.tls = tls;
             }
             self.touch(&key);
         } else {
-            let cpu = self.cpu_index();
-            self.insert_new(key, state, application, tls, now, cpu);
+            self.insert_new(key, state, application, tls, last_seen);
         }
     }
 
@@ -321,44 +286,178 @@ impl FlowTable {
             self.lru.remove(pos);
         }
     }
+}
 
-    fn cpu_index(&self) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::thread::current().id().hash(&mut hasher);
-        (hasher.finish() as usize) % self.stats.len()
+#[derive(Debug)]
+pub struct FlowTable {
+    capacity: usize,
+    shards: Vec<FlowShard>,
+    timeouts: FlowTimeouts,
+    last_evicted: Option<FlowKey>,
+}
+
+impl FlowTable {
+    pub fn new(capacity: usize) -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        FlowTable::with_shards(capacity, cores)
     }
 
-    fn timeout_for(&self, state: FlowState) -> Duration {
-        match state {
-            FlowState::New | FlowState::SynSent | FlowState::SynReceived => self.handshake_timeout,
-            FlowState::Established => self.established_timeout,
-            FlowState::FinWait => Duration::from_secs(60),
-            FlowState::Closed => self.closed_timeout,
+    pub fn with_shards(capacity: usize, shards: usize) -> Self {
+        let capacity = capacity.max(1);
+        let shard_count = shard_count(capacity, shards);
+        let mut shard_vec = Vec::with_capacity(shard_count);
+        for idx in 0..shard_count {
+            shard_vec.push(FlowShard::new(shard_capacity(capacity, shard_count, idx)));
+        }
+        FlowTable {
+            capacity,
+            shards: shard_vec,
+            timeouts: FlowTimeouts {
+                handshake_timeout: Duration::from_secs(30),
+                established_timeout: Duration::from_secs(300),
+                closed_timeout: Duration::from_secs(15),
+            },
+            last_evicted: None,
         }
     }
 
-    fn bump_packet(&mut self, cpu: usize) {
-        if let Some(stat) = self.stats.get_mut(cpu) {
-            stat.add_packet();
+    pub fn observe(&mut self, meta: &PacketMetadata, now: Instant) -> FlowOutcome {
+        let key = FlowKey::from_metadata(meta);
+        let shard_idx = self.select_shard(&key);
+        let shard = self
+            .shards
+            .get_mut(shard_idx)
+            .expect("flow shard index out of range");
+        let outcome = shard.observe(key, meta, now, &self.timeouts);
+        self.last_evicted = shard.last_evicted.take();
+        outcome
+    }
+
+    pub fn stats(&self) -> FlowStats {
+        let mut agg = FlowStats::default();
+        for shard in &self.shards {
+            let stats = shard.stats();
+            agg.packets += stats.packets;
+            agg.new_flows += stats.new_flows;
+            agg.evicted += stats.evicted;
+        }
+        agg
+    }
+
+    pub fn set_capacity(&mut self, new_capacity: usize) {
+        let new_capacity = new_capacity.max(1);
+        let desired_shards = shard_count(
+            new_capacity,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        );
+        if desired_shards != self.shards.len() {
+            self.rebuild(new_capacity, desired_shards);
+            return;
+        }
+        self.capacity = new_capacity;
+        let shard_count = self.shards.len();
+        for (idx, shard) in self.shards.iter_mut().enumerate() {
+            shard.set_capacity(shard_capacity(new_capacity, shard_count, idx));
         }
     }
 
-    fn bump_new_flow(&mut self, cpu: usize) {
-        if let Some(stat) = self.stats.get_mut(cpu) {
-            stat.add_flow();
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(FlowShard::len).sum()
+    }
+
+    pub fn contains(&self, key: &FlowKey) -> bool {
+        let idx = self.select_shard(key);
+        self.shards
+            .get(idx)
+            .map(|shard| shard.contains(key))
+            .unwrap_or(false)
+    }
+
+    pub fn snapshot(&self) -> Vec<FlowSnapshot> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.snapshot());
+        }
+        out
+    }
+
+    pub fn export_state(&self) -> FlowSyncState {
+        FlowSyncState {
+            flows: self.snapshot(),
+            stats: self.stats(),
         }
     }
 
-    fn bump_evicted(&mut self, cpu: usize) {
-        if let Some(stat) = self.stats.get_mut(cpu) {
-            stat.add_evicted();
+    pub fn import_state(&mut self, state: &FlowSyncState, _now: Instant) {
+        for snap in &state.flows {
+            let idx = self.select_shard(&snap.key);
+            if let Some(shard) = self.shards.get_mut(idx) {
+                shard.import_snapshot(snap);
+            }
         }
+        if let Some(shard) = self.shards.first_mut() {
+            shard.stats.packets = shard.stats.packets.max(state.stats.packets);
+            shard.stats.new_flows = shard.stats.new_flows.max(state.stats.new_flows);
+            shard.stats.evicted = shard.stats.evicted.max(state.stats.evicted);
+        }
+    }
+
+    pub fn reap_expired(&mut self, now: Instant) -> usize {
+        let mut removed = 0usize;
+        for shard in &mut self.shards {
+            removed += shard.reap_expired(now, &self.timeouts);
+        }
+        removed
     }
 
     pub fn take_last_evicted(&mut self) -> Option<FlowKey> {
         self.last_evicted.take()
     }
+
+    fn select_shard(&self, key: &FlowKey) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len().max(1)
+    }
+
+    fn rebuild(&mut self, new_capacity: usize, new_shards: usize) {
+        let snapshots = self.snapshot();
+        let aggregated = self.stats();
+        let mut rebuilt = FlowTable::with_shards(new_capacity, new_shards);
+        for snap in &snapshots {
+            let idx = rebuilt.select_shard(&snap.key);
+            if let Some(shard) = rebuilt.shards.get_mut(idx) {
+                shard.import_snapshot(snap);
+            }
+        }
+        if let Some(shard) = rebuilt.shards.first_mut() {
+            shard.stats = aggregated;
+        }
+        self.capacity = rebuilt.capacity;
+        self.shards = rebuilt.shards;
+        self.timeouts = rebuilt.timeouts;
+        self.last_evicted = None;
+    }
+}
+
+fn shard_count(capacity: usize, requested: usize) -> usize {
+    let requested = requested.max(1);
+    requested.min(capacity.max(1))
+}
+
+fn shard_capacity(total: usize, shards: usize, idx: usize) -> usize {
+    let base = total / shards;
+    let rem = total % shards;
+    base + if idx < rem { 1 } else { 0 }
 }
 
 pub(crate) fn initial_state(proto: IpProtocol, tcp_flags: Option<u16>) -> FlowState {
@@ -428,6 +527,20 @@ pub(crate) fn advance_state(current: FlowState, tcp_flags: Option<u16>) -> FlowS
     }
 }
 
-pub(crate) fn is_expired(state: FlowState, last_seen: Instant, now: Instant, table: &FlowTable) -> bool {
-    now.duration_since(last_seen) > table.timeout_for(state)
+fn is_expired(
+    state: FlowState,
+    last_seen: Instant,
+    now: Instant,
+    timeouts: &FlowTimeouts,
+) -> bool {
+    now.duration_since(last_seen) > timeout_for(state, timeouts)
+}
+
+fn timeout_for(state: FlowState, timeouts: &FlowTimeouts) -> Duration {
+    match state {
+        FlowState::New | FlowState::SynSent | FlowState::SynReceived => timeouts.handshake_timeout,
+        FlowState::Established => timeouts.established_timeout,
+        FlowState::FinWait => Duration::from_secs(60),
+        FlowState::Closed => timeouts.closed_timeout,
+    }
 }
