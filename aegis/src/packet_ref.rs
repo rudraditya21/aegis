@@ -41,10 +41,6 @@ impl SharedFrame {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-
-    pub fn timestamp(&self) -> Option<SystemTime> {
-        self.timestamp
-    }
 }
 
 impl FrameView for SharedFrame {

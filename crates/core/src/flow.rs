@@ -335,6 +335,28 @@ impl FlowTable {
         outcome
     }
 
+    pub fn observe_on_shard(
+        &mut self,
+        shard_idx: usize,
+        meta: &PacketMetadata,
+        now: Instant,
+    ) -> Result<FlowOutcome, String> {
+        if shard_idx >= self.shards.len() {
+            return Err(format!(
+                "flow shard {shard_idx} out of range (shards={})",
+                self.shards.len()
+            ));
+        }
+        let key = FlowKey::from_metadata(meta);
+        let shard = self
+            .shards
+            .get_mut(shard_idx)
+            .ok_or_else(|| "flow shard index out of range".to_string())?;
+        let outcome = shard.observe(key, meta, now, &self.timeouts);
+        self.last_evicted = shard.last_evicted.take();
+        Ok(outcome)
+    }
+
     pub fn stats(&self) -> FlowStats {
         let mut agg = FlowStats::default();
         for shard in &self.shards {
@@ -466,6 +488,42 @@ fn shard_capacity(total: usize, shards: usize, idx: usize) -> usize {
     let base = total / shards;
     let rem = total % shards;
     base + if idx < rem { 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ApplicationType, Direction, PacketMetadata};
+    use packet_parser::IpProtocol;
+
+    fn meta() -> PacketMetadata {
+        PacketMetadata {
+            direction: Direction::Ingress,
+            src_ip: "10.0.0.1".parse().unwrap(),
+            dst_ip: "10.0.0.2".parse().unwrap(),
+            protocol: IpProtocol::Tcp,
+            src_port: Some(1234),
+            dst_port: Some(443),
+            seq_number: None,
+            tcp_flags: None,
+            application: ApplicationType::Unknown,
+            payload: Vec::new(),
+            signatures: Vec::new(),
+            user: None,
+            geo: None,
+            tls: None,
+        }
+    }
+
+    #[test]
+    fn observe_on_shard_uses_explicit_index() {
+        let mut table = FlowTable::with_shards(8, 2);
+        let meta = meta();
+        let key = FlowKey::from_metadata(&meta);
+        table.observe_on_shard(1, &meta, Instant::now()).unwrap();
+        assert!(table.shards[1].contains(&key));
+        assert!(!table.shards[0].contains(&key));
+    }
 }
 
 pub(crate) fn initial_state(proto: IpProtocol, tcp_flags: Option<u16>) -> FlowState {

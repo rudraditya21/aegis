@@ -40,7 +40,7 @@ def pkt():
     ip=struct.pack("!BBHHHBBHII",ver_ihl,0,total_len,1,0x4000,64,6,0,0x0a000001,0x0a000002)
     tcp=struct.pack("!HHIIHHHH",12345,80,1,0,(5<<12)|0x18,65535,0,0)
     frame=eth+ip+tcp+payload
-    print(" ".join(f\"{b:02x}\" for b in frame))
+    print(" ".join(f"{b:02x}" for b in frame))
 pkt()
 PY
 )"

@@ -26,7 +26,7 @@ default deny ingress
 RULES
 
 cat >"$POLICY_FILE" <<'POLICY'
-priority 10 action allow user alice geo US time 9-17
+priority 10 action allow src 10.0.0.0/8 user alice geo US time 9-17
 priority 5 action deny src 192.168.10.0/24
 POLICY
 

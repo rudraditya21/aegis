@@ -290,11 +290,12 @@ pub trait TxLease {
 }
 
 #[derive(Debug)]
-pub struct UnsupportedTxLease {
+pub struct UnsupportedTxLease<'a> {
     buf: [u8; 0],
+    _marker: std::marker::PhantomData<&'a mut ()>,
 }
 
-impl TxLease for UnsupportedTxLease {
+impl TxLease for UnsupportedTxLease<'_> {
     fn buffer(&mut self) -> &mut [u8] {
         &mut self.buf
     }
@@ -382,7 +383,7 @@ pub enum AnyTxLease<'a> {
     AfXdp(af_xdp::AfXdpTxLease<'a>),
     #[cfg(all(feature = "dpdk", target_os = "linux"))]
     Dpdk(dpdk::DpdkTxLease<'a>),
-    Unsupported(UnsupportedTxLease),
+    Unsupported(UnsupportedTxLease<'a>),
 }
 
 impl TxLease for AnyTxLease<'_> {
@@ -580,6 +581,7 @@ impl Dataplane for DataplaneHandle {
     }
 
     fn lease_tx(&mut self, len: usize) -> Result<Self::Tx<'_>, DataplaneError> {
+        let _ = len;
         match self {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(_) => Err(DataplaneError::Unsupported(
@@ -599,16 +601,22 @@ impl Dataplane for DataplaneHandle {
             #[cfg(feature = "pcap")]
             DataplaneHandle::Pcap(dp) => match frame {
                 AnyFrame::Pcap(frame) => dp.send_frame(frame),
+                #[cfg(any(
+                    all(feature = "af-xdp", target_os = "linux"),
+                    all(feature = "dpdk", target_os = "linux")
+                ))]
                 _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
             #[cfg(all(feature = "af-xdp", target_os = "linux"))]
             DataplaneHandle::AfXdp(dp) => match frame {
                 AnyFrame::AfXdp(frame) => <AfXdpDataplane as Dataplane>::send_frame(dp, frame),
+                #[cfg(any(feature = "pcap", all(feature = "dpdk", target_os = "linux")))]
                 _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
             #[cfg(all(feature = "dpdk", target_os = "linux"))]
             DataplaneHandle::Dpdk(dp) => match frame {
                 AnyFrame::Dpdk(frame) => <DpdkDataplane as Dataplane>::send_frame(dp, frame),
+                #[cfg(any(feature = "pcap", all(feature = "af-xdp", target_os = "linux")))]
                 _ => Err(DataplaneError::Unsupported("frame type mismatch")),
             },
         }

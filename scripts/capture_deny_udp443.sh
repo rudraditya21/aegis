@@ -2,7 +2,13 @@
 set -euo pipefail
 cd -- "$(dirname "$0")/.."
 
-CONFIG_ROOT="${CONFIG_ROOT:-/etc/aegis}"
+CONFIG_ROOT="${CONFIG_ROOT:-}"
+if [[ -z "$CONFIG_ROOT" ]]; then
+  CONFIG_ROOT="$(mktemp -d)"
+  trap 'rm -rf "$CONFIG_ROOT"' EXIT
+fi
+export AEGIS_CONFIG_ROOT="$CONFIG_ROOT"
+export FIREWALL_CONFIG_ROOT="$CONFIG_ROOT"
 RULES="${RULES:-$CONFIG_ROOT/rules/l3l4.rules}"
 
 mkdir -p "$CONFIG_ROOT/rules" "$CONFIG_ROOT/logs" "$CONFIG_ROOT/state" "$CONFIG_ROOT/intel"
@@ -15,9 +21,21 @@ RULES
 
 cargo build -p aegis --release >/dev/null
 
-sudo AEGIS_CONFIG_ROOT="$CONFIG_ROOT" FIREWALL_CONFIG_ROOT="$CONFIG_ROOT" \
-  ./target/release/aegis capture \
+if [[ ${EUID} -ne 0 ]]; then
+  echo "[capture] Skipping live capture; requires elevated permissions."
+  exit 0
+fi
+
+if [[ -z "${IFACE:-}" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    IFACE="lo0"
+  else
+    IFACE="lo"
+  fi
+fi
+
+./target/release/aegis capture \
   --rules "$RULES" \
-  --iface "${IFACE:-en0}" \
+  --iface "$IFACE" \
   --count "${COUNT:-200}" \
   --no-logs

@@ -42,7 +42,7 @@ impl FrameView for PcapFrame<'_> {
 
 impl Dataplane for PcapDataplane {
     type Frame<'a> = PcapFrame<'a>;
-    type Tx<'a> = UnsupportedTxLease;
+    type Tx<'a> = UnsupportedTxLease<'a>;
 
     fn next_frame(&mut self) -> Result<Option<Self::Frame<'_>>, DataplaneError> {
         match self.capture.next() {

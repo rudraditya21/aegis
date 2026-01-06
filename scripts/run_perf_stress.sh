@@ -91,13 +91,21 @@ bench() {
   done
   end_ns=$(date +%s%N)
   elapsed_ns=$((end_ns - start_ns))
-  python3 - <<PY
-runs=$runs
-elapsed=$elapsed_ns/1e9
-pps=runs/elapsed
-gbps=(pps*${bytes_per_frame}*8)/1e9
+  export LABEL="$label"
+  export RUNS="$runs"
+  export ELAPSED_NS="$elapsed_ns"
+  export BYTES_PER_FRAME="$bytes_per_frame"
+  python3 - <<'PY'
+import os
+label = os.environ["LABEL"]
+runs = int(os.environ["RUNS"])
+elapsed = int(os.environ["ELAPSED_NS"]) / 1e9
+bytes_per_frame = int(os.environ["BYTES_PER_FRAME"])
+pps = runs / elapsed
+gbps = (pps * bytes_per_frame * 8) / 1e9
 print(f"{label}: {pps:.2f} evals/sec ({gbps:.3f} Gbps payload-equivalent) over {runs} runs")
 PY
+  unset LABEL RUNS ELAPSED_NS BYTES_PER_FRAME
 }
 
 echo "[throughput] TCP allow (stateless)..."
@@ -128,6 +136,7 @@ PY
 
 echo "[latency] Measuring eval latency (p50/p95/p99)..."
 LAT_RUNS=${LAT_RUNS:-200}
+export RULES_FILE HTTP_HEX
 python3 - <<'PY'
 import subprocess, time, statistics, os
 runs=int(os.environ.get("LAT_RUNS","200"))

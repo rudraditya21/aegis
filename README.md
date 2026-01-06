@@ -162,8 +162,8 @@ DPDK (Linux only):
 
 Operational tuning:
 - `rss.*` aligns flow distribution with RX queues and CPU affinity.
-- `flow-shards` should match worker count for per-core isolation.
-- Use `dataplane-diag` and `metrics --iface` to verify hugepage/NUMA readiness and zero-copy support.
+- `flow-shards` defaults to the worker count when RSS sharding is enabled; each worker evaluates only its shard for per-core flow ownership.
+- Use `dataplane-diag` and `metrics --iface` to verify hugepage/NUMA readiness, RSS config, shard affinity, and zero-copy support.
 - For zero-copy TX, lease buffers via the dataplane `lease_tx` API; `send_frame` remains a safe copy-based fallback.
 
 ## Implemented Features
@@ -190,13 +190,20 @@ Operational tuning:
 | Attack simulations | SYN/ACK/UDP/ICMP floods, DNS amplification, HTTP flood/Slowloris, obfuscation/double-encoding, TLS handshake flood, fragmented TLS ClientHello, TCP segmentation evasion, fragmentation, protocol confusion, exploit signatures, C2 beaconing | `bash scripts/run_regressions.sh` (runs all) or individual `scripts/attack_*.sh` |
 | Policy correctness | LPM precedence, port deny precedence, default deny | `bash scripts/run_policy_correctness.sh` |
 | Performance & stress | Throughput/latency/flow-scale/rule-scale, eval-batch (Rayon), optional iperf3/tcpreplay/hping3/wrk/dnsperf hooks | `bash scripts/run_perf_stress.sh` |
+| Real traffic validation | tcpreplay PCAP replay + iperf3 throughput against live hosts | `bash scripts/run_real_traffic_validation.sh --iface eth0 --pcap sample.pcap --iperf-server 10.0.0.2` |
 | Stability/soak | Mixed traffic/attacks over time (configurable; smoke with SOAK_DURATION=300) | `SOAK_DURATION=300 bash scripts/run_long_soak.sh` |
 | Chaos | Fail-open/closed kill test, reload storm, memory/fd pressure | `bash scripts/chaos_userspace_crash.sh`, `bash scripts/chaos_config_reload_storm.sh`, `bash scripts/chaos_resource_exhaustion.sh` |
 | Feature matrix | End-to-end sample flows across rule/policy features | `bash scripts/run_feature_matrix.sh` |
+
+CI guidance:
+- CI runs unit/regression/feature-matrix suites only; real-traffic validation (tcpreplay/iperf3) requires privileged NIC access and is expected to run on a testbed or self-hosted runner.
+- Use `dataplane-diag` and `metrics --iface` in staging to confirm RSS/zero-copy/NUMA/shard affinity before load testing.
+- Real-traffic validation expects `tcpreplay` and `iperf3` installed on the traffic generator host(s).
 
 ## Shortcuts
 
 - Full regressions: `bash scripts/run_regressions.sh`
 - Perf (synthetic): `bash scripts/run_perf_stress.sh`
+- Real traffic: `bash scripts/run_real_traffic_validation.sh --iface eth0 --pcap sample.pcap --iperf-server 10.0.0.2`
 - Stability smoke (5m): `SOAK_DURATION=300 bash scripts/run_long_soak.sh`
 - Everything (tests + attacks + feature matrix): `bash scripts/run_all_tests.sh`

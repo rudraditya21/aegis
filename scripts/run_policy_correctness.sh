@@ -14,14 +14,28 @@ fi
 unset AEGIS_CONFIG_READONLY
 unset FIREWALL_CONFIG_READONLY
 RULES_FILE="$FIREWALL_CONFIG_ROOT/rules.conf"
+POLICIES_FILE="$FIREWALL_CONFIG_ROOT/policies.conf"
+CONFLICT_RULES_FILE="$FIREWALL_CONFIG_ROOT/rules_conflict.conf"
 trap 'rm -rf "$CONFIG_ROOT"' EXIT
 
-# Rule set exercises precedence: longer CIDR deny beats broader allow; port deny beats allow; default deny.
+# Rule set avoids CIDR/port conflicts (conflicts are now rejected by validation).
 cat >"$RULES_FILE" <<'RULES'
 allow cidr 10.0.0.0/8 ingress
-deny cidr 10.0.1.0/24 ingress
 allow port tcp 443 ingress
 deny port tcp 22 ingress
+default deny ingress
+RULES
+
+# Policy set exercises override behavior without overlapping policy conflicts.
+cat >"$POLICIES_FILE" <<'POLICIES'
+priority 10 action deny src 10.0.2.0/24
+priority 5 action allow src 192.168.50.0/24
+POLICIES
+
+# Conflicting ruleset for validation error checks.
+cat >"$CONFLICT_RULES_FILE" <<'RULES'
+allow cidr 10.0.0.0/8 ingress
+deny cidr 10.0.1.0/24 ingress
 default deny ingress
 RULES
 
@@ -30,10 +44,28 @@ cargo build -p aegis --release >/dev/null
 
 eval_expect() {
   local hex="$1" expect="$2" msg="$3"
-  out=$(./target/release/aegis eval --rules "$RULES_FILE" --direction ingress --hex "$hex" --no-logs --disable-ips --disable-ids 2>&1)
+  if ! out=$(./target/release/aegis eval --rules "$RULES_FILE" --policies "$POLICIES_FILE" --direction ingress --hex "$hex" --no-logs --disable-ips --disable-ids 2>&1); then
+    echo "$out"
+    echo "[policy] FAIL: $msg (eval failed)" >&2
+    exit 1
+  fi
   echo "$out"
   if ! echo "$out" | grep -q "Action: $expect"; then
     echo "[policy] FAIL: $msg (expected $expect)" >&2
+    exit 1
+  fi
+}
+
+eval_expect_error() {
+  local rules_path="$1" hex="$2" msg="$3" needle="$4"
+  if out=$(./target/release/aegis eval --rules "$rules_path" --direction ingress --hex "$hex" --no-logs --disable-ips --disable-ids 2>&1); then
+    echo "$out"
+    echo "[policy] FAIL: $msg (expected error)" >&2
+    exit 1
+  fi
+  echo "$out"
+  if ! echo "$out" | grep -q "$needle"; then
+    echo "[policy] FAIL: $msg (missing expected error)" >&2
     exit 1
   fi
 }
@@ -56,21 +88,28 @@ print(" ".join(f"{b:02x}" for b in frame))
 PY
 }
 
-HEX_ALLOW=$(packet_hex 10.0.2.5 10.0.0.9 40000 443)
-HEX_DENY_CIDR=$(packet_hex 10.0.1.5 10.0.0.9 40000 80)
+HEX_ALLOW_PORT=$(packet_hex 8.8.8.8 1.1.1.1 40000 443)
+HEX_POLICY_DENY=$(packet_hex 10.0.2.5 10.0.0.9 40000 80)
+HEX_POLICY_ALLOW=$(packet_hex 192.168.50.5 192.168.60.5 40000 80)
 HEX_DENY_PORT=$(packet_hex 10.0.2.5 10.0.0.9 40000 22)
 HEX_DEFAULT=$(packet_hex 8.8.8.8 1.1.1.1 12345 80)
 
-echo "[policy] Checking longer-prefix deny wins over broader allow..."
-eval_expect "$HEX_DENY_CIDR" "Deny" "CIDR priority"
+echo "[policy] Checking policy deny overrides base allow..."
+eval_expect "$HEX_POLICY_DENY" "Deny" "Policy deny overrides allow"
 
-echo "[policy] Checking allow on non-conflicting subnet..."
-eval_expect "$HEX_ALLOW" "Allow" "Allow broad CIDR"
+echo "[policy] Checking policy allow overrides base deny..."
+eval_expect "$HEX_POLICY_ALLOW" "Allow" "Policy allow overrides default deny"
 
 echo "[policy] Checking port deny overrides allow..."
 eval_expect "$HEX_DENY_PORT" "Deny" "Port deny precedence"
 
+echo "[policy] Checking port allow applies without policy..."
+eval_expect "$HEX_ALLOW_PORT" "Allow" "Port allow"
+
 echo "[policy] Checking default deny applies to unmatched traffic..."
 eval_expect "$HEX_DEFAULT" "Deny" "Default deny"
+
+echo "[policy] Checking conflicting CIDR rules are rejected..."
+eval_expect_error "$CONFLICT_RULES_FILE" "$HEX_POLICY_DENY" "CIDR conflict detection" "conflicting CIDR rules overlap"
 
 echo "[policy] Policy correctness checks passed."

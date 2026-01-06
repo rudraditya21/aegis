@@ -979,6 +979,22 @@ fn resolve_shard_plan(dp_cfg: &DataplaneConfig) -> Result<ShardPlan, String> {
     }
 }
 
+fn shard_plan_worker_count(plan: &ShardPlan) -> usize {
+    match plan {
+        ShardPlan::Single => 1,
+        ShardPlan::PerQueue { queues } => queues.len().max(1),
+        ShardPlan::Software { workers } => (*workers).max(1),
+    }
+}
+
+fn shard_plan_label(plan: &ShardPlan) -> String {
+    match plan {
+        ShardPlan::Single => "single".to_string(),
+        ShardPlan::PerQueue { queues } => format!("per-queue (queues={})", queues.len()),
+        ShardPlan::Software { workers } => format!("software (workers={workers})"),
+    }
+}
+
 fn normalize_queue_list(mut queues: Vec<u16>, max: u16) -> Result<Vec<u16>, String> {
     if queues.is_empty() {
         return Err("rss queue list is empty".into());
@@ -1013,6 +1029,21 @@ fn resolve_worker_core(
         .copied()
         .ok_or_else(|| "cpu_affinity index missing".to_string())
         .map(Some)
+}
+
+fn tuning_for_workers(tuning: &Tuning, worker_count: usize) -> Result<Tuning, String> {
+    let worker_count = worker_count.max(1);
+    let mut tuned = tuning.clone();
+    match tuned.flow_shards {
+        Some(shards) if shards != worker_count => {
+            return Err(format!(
+                "flow_shards must match worker count ({worker_count}) for sharded capture"
+            ));
+        }
+        Some(_) => {}
+        None => tuned.flow_shards = Some(worker_count),
+    }
+    Ok(tuned)
 }
 
 fn pin_current_thread(core_id: usize) -> Result<(), String> {
@@ -1189,9 +1220,8 @@ fn run_capture_per_queue(
     let rules_path = rules_path.to_path_buf();
     let policies_path = policies_path.map(|p| p.to_path_buf());
     let audit_log = audit_log.map(|s| s.to_string());
-    let tuning = tuning.clone();
-
     let worker_count = queues.len();
+    let tuning = tuning_for_workers(tuning, worker_count)?;
     for (worker_index, queue) in queues.into_iter().enumerate() {
         let core_id = resolve_worker_core(rss, worker_index, worker_count)?;
         let worker_id = worker_index;
@@ -1217,6 +1247,12 @@ fn run_capture_per_queue(
                 disable_geo,
                 disable_time,
             )?;
+            let flow_shards = mgr.flow_shard_count();
+            if flow_shards != worker_count {
+                return Err(format!(
+                    "flow shard count {flow_shards} does not match worker count {worker_count}"
+                ));
+            }
             let capture_payload = capture_payload_enabled(&mgr);
             let mut local_processed = 0usize;
             let mut dataplane =
@@ -1249,7 +1285,9 @@ fn run_capture_per_queue(
                         if let Ok(meta) =
                             packet_metadata(frame.bytes(), Direction::Ingress, capture_payload)
                         {
-                            let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
+                            let eval = mgr
+                                .evaluate_on_shard(&meta, Some(&iface), Instant::now(), worker_id)
+                                .map_err(|e| format!("flow shard {worker_id}: {e}"))?;
                             if let Some(path) = &audit_log {
                                 let _ = write_audit(path, &meta, &eval);
                             }
@@ -1322,7 +1360,7 @@ fn run_capture_software_sharded(
     let rules_path = rules_path.to_path_buf();
     let policies_path = policies_path.map(|p| p.to_path_buf());
     let audit_log = audit_log.map(|s| s.to_string());
-    let tuning = tuning.clone();
+    let tuning = tuning_for_workers(tuning, workers)?;
 
     let capture_payload = !disable_ids || !disable_ips;
     for worker_index in 0..workers {
@@ -1349,6 +1387,12 @@ fn run_capture_software_sharded(
                 disable_geo,
                 disable_time,
             )?;
+            let flow_shards = mgr.flow_shard_count();
+            if flow_shards != workers {
+                return Err(format!(
+                    "flow shard count {flow_shards} does not match worker count {workers}"
+                ));
+            }
             let capture_payload = capture_payload_enabled(&mgr);
             let mut local_processed = 0usize;
             for item in rx {
@@ -1361,7 +1405,9 @@ fn run_capture_software_sharded(
                         }
                     }
                 };
-                let eval = mgr.evaluate(&meta, Some(&iface), Instant::now());
+                let eval = mgr
+                    .evaluate_on_shard(&meta, Some(&iface), Instant::now(), worker_id)
+                    .map_err(|e| format!("flow shard {worker_id}: {e}"))?;
                 if let Some(path) = &audit_log {
                     let _ = write_audit(path, &meta, &eval);
                 }
@@ -1628,7 +1674,22 @@ fn cmd_metrics(args: Vec<String>) -> Result<(), String> {
     let policies_path = policies_path
         .map(|p| resolve_config_path(&p, false))
         .transpose()?;
-    let tuning = Tuning::default();
+    let runtime = load_runtime_config(&config_root())?;
+    let dp_cfg = runtime.dataplane.clone();
+    let plan = match resolve_shard_plan(&dp_cfg) {
+        Ok(plan) => Some(plan),
+        Err(err) => {
+            eprintln!("Shard plan unavailable: {err}");
+            None
+        }
+    };
+    let mut tuning = Tuning::default();
+    if let Some(plan) = plan.as_ref() {
+        let workers = shard_plan_worker_count(plan);
+        if workers > 1 {
+            tuning.flow_shards = Some(workers);
+        }
+    }
     let mgr = load_manager(&rules_path, policies_path.as_deref(), &tuning)?;
     let stats = mgr.flow_stats();
     println!(
@@ -1640,6 +1701,24 @@ fn cmd_metrics(args: Vec<String>) -> Result<(), String> {
         mgr.flow_capacity(),
         mgr.flow_shard_count()
     );
+    if let Some(plan) = plan.as_ref() {
+        let workers = shard_plan_worker_count(plan);
+        if workers > 1 {
+            let status = if mgr.flow_shard_count() == workers {
+                "aligned"
+            } else {
+                "mismatch"
+            };
+            println!(
+                "Shard plan {} workers={} (flow_shards {})",
+                shard_plan_label(plan),
+                workers,
+                status
+            );
+        } else {
+            println!("Shard plan {} workers=1 (affinity n/a)", shard_plan_label(plan));
+        }
+    }
     println!(
         "IDS enabled={} IPS enabled={} Failover enabled={}",
         mgr.ids_enabled(),
@@ -1661,6 +1740,19 @@ fn print_dataplane_metrics(iface: Option<&str>) -> Result<(), String> {
     let runtime = load_runtime_config(&config_root())?;
     let dp_cfg = runtime.dataplane;
     println!("Dataplane backend: {:?}", dp_cfg.backend);
+    if let Some(rss) = dp_cfg.rss.as_ref() {
+        println!(
+            "RSS config enabled={} symmetric={} queues={:?} cpu_affinity={:?} hash_fields={:?} seed={:?}",
+            rss.enabled,
+            rss.symmetric,
+            rss.queues,
+            rss.cpu_affinity,
+            rss.hash_fields,
+            rss.seed
+        );
+    } else {
+        println!("RSS config: disabled");
+    }
     let iface = match iface {
         Some(name) => name,
         None => {
@@ -1686,6 +1778,11 @@ fn print_dataplane_metrics(iface: Option<&str>) -> Result<(), String> {
         caps.supports_tx,
         caps.supports_filters
     );
+    if let Some(rss) = dp_cfg.rss.as_ref() {
+        if rss.enabled && !caps.supports_rss {
+            println!("Dataplane rss: enabled in config but not supported by backend");
+        }
+    }
     match &mut dp {
         #[cfg(all(feature = "af-xdp", target_os = "linux"))]
         DataplaneHandle::AfXdp(inner) => {
@@ -2062,6 +2159,19 @@ fn cmd_dataplane_diag(args: Vec<String>) -> Result<(), String> {
     let runtime = load_runtime_config(&config_root())?;
     let dp_cfg = runtime.dataplane;
     println!("Dataplane backend: {:?}", dp_cfg.backend);
+    if let Some(rss) = dp_cfg.rss.as_ref() {
+        println!(
+            "RSS config enabled={} symmetric={} queues={:?} cpu_affinity={:?} hash_fields={:?} seed={:?}",
+            rss.enabled,
+            rss.symmetric,
+            rss.queues,
+            rss.cpu_affinity,
+            rss.hash_fields,
+            rss.seed
+        );
+    } else {
+        println!("RSS config: disabled");
+    }
 
     let mut warnings: Vec<String> = Vec::new();
     let mut issues: Vec<String> = Vec::new();
@@ -2099,6 +2209,18 @@ fn cmd_dataplane_diag(args: Vec<String>) -> Result<(), String> {
             let cfg = dp_cfg.dpdk.clone().unwrap_or_default();
             validate_dpdk_diag(&cfg, &hugepages, &numa_nodes, &mut warnings, &mut issues)?;
         }
+    }
+
+    match resolve_shard_plan(&dp_cfg) {
+        Ok(plan) => {
+            let workers = shard_plan_worker_count(&plan);
+            println!(
+                "Shard plan {} workers={}",
+                shard_plan_label(&plan),
+                workers
+            );
+        }
+        Err(err) => issues.push(format!("shard plan: {err}")),
     }
 
     if !warnings.is_empty() {

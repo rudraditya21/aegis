@@ -1350,7 +1350,7 @@ impl FirewallManager {
         interface: Option<&str>,
         now: Instant,
     ) -> Evaluation {
-        let mut meta = self.enrich_metadata(meta);
+        let meta = self.enrich_metadata(meta);
         let flow_key = FlowKey::from_metadata(&meta);
         let shard_idx = self.flows.shard_for_key(&flow_key);
         let ruleset = self.rule_cache.rules_for_shard(shard_idx);
@@ -1366,8 +1366,7 @@ impl FirewallManager {
         } else {
             Action::Deny
         };
-        let mut action = base_action.clone();
-        let mut matched_rule = if !has_rules {
+        let matched_rule = if !has_rules {
             None
         } else {
             self.matching_rule_id(&meta, &base_action)
@@ -1376,6 +1375,71 @@ impl FirewallManager {
         if let Some(evicted) = self.flows.take_last_evicted() {
             self.note_flow_eviction(evicted, now);
         }
+        self.evaluate_with_flow(meta, interface, now, flow_key, flow, base_action, matched_rule)
+    }
+
+    pub fn evaluate_on_shard(
+        &mut self,
+        meta: &PacketMetadata,
+        interface: Option<&str>,
+        now: Instant,
+        shard_idx: usize,
+    ) -> Result<Evaluation, String> {
+        let shard_count = self.flows.shard_count();
+        if shard_idx >= shard_count {
+            return Err(format!(
+                "flow shard {shard_idx} out of range (shards={shard_count})"
+            ));
+        }
+        let meta = self.enrich_metadata(meta);
+        let flow_key = FlowKey::from_metadata(&meta);
+        let ruleset = self.rule_cache.rules_for_shard(shard_idx);
+        let iface_allowed = self.interface_allowed(interface);
+        let has_rules = !self.rule_cache.is_empty();
+        let base_action = if !has_rules {
+            match self.fail_mode {
+                FailMode::FailOpen => Action::Allow,
+                FailMode::FailClosed => Action::Deny,
+            }
+        } else if iface_allowed {
+            ruleset.evaluate(&meta)
+        } else {
+            Action::Deny
+        };
+        let matched_rule = if !has_rules {
+            None
+        } else {
+            self.matching_rule_id(&meta, &base_action)
+        };
+        let flow = self
+            .flows
+            .observe_on_shard(shard_idx, &meta, now)
+            .map_err(|e| format!("flow shard {shard_idx}: {e}"))?;
+        if let Some(evicted) = self.flows.take_last_evicted() {
+            self.note_flow_eviction(evicted, now);
+        }
+        Ok(self.evaluate_with_flow(
+            meta,
+            interface,
+            now,
+            flow_key,
+            flow,
+            base_action,
+            matched_rule,
+        ))
+    }
+
+    fn evaluate_with_flow(
+        &mut self,
+        mut meta: PacketMetadata,
+        interface: Option<&str>,
+        now: Instant,
+        flow_key: FlowKey,
+        flow: FlowOutcome,
+        base_action: Action,
+        mut matched_rule: Option<u64>,
+    ) -> Evaluation {
+        let mut action = base_action.clone();
         let mut blocked_by_protector = false;
         if self.ips_enabled && !self.protector.check(&meta, &flow, now) {
             action = Action::Deny;
